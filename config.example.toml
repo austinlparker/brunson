@@ -1,0 +1,32 @@
+# brunson configuration
+
+[github]
+# Repositories to watch. Empty = all PRs involving you.
+# Entries can be org names ("myorg") or org/repo pairs ("myorg/important-repo").
+watch = []
+# Poll interval in seconds
+poll_interval = 300
+
+[daemon]
+# Local HTTP API port
+port = 17890
+# If the TUI spawned the daemon, kill it on TUI exit
+kill_on_tui_exit = false
+
+[llm]
+# Enable LLM classification via LM Studio
+enabled = false
+# LM Studio OpenAI-compatible endpoint
+endpoint = "http://localhost:1234/v1"
+# Model name (empty = auto-detect via GET /v1/models)
+model = ""
+# Re-classify when a PR changes state
+classify_on_change = true
+# Maximum completion tokens for classification. Reasoning-heavy local models may need more than 200.
+max_output_tokens = 4096
+
+[tui]
+# Diff style: "unified" or "side-by-side"
+diff_style = "unified"
+# Show line numbers in diff view
+show_line_numbers = true

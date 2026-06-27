@@ -1,0 +1,25 @@
+[workspace]
+members = ["cargo:."]
+name = "brunson"
+
+# cargo-dist release configuration
+[dist]
+# Pin to the cargo-dist version used to generate the release workflow.
+cargo-dist-version = "0.32.0"
+# Use GitHub Actions for releases.
+ci = "github"
+# Generate shell and Homebrew installers.
+installers = ["shell", "homebrew"]
+# Publish the Homebrew formula to this tap.
+tap = "austinlparker/homebrew-brunson"
+# Build for macOS Intel, macOS Apple Silicon, Linux x86_64, and Linux ARM64.
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Open/update a Homebrew formula PR on release.
+publish-jobs = ["homebrew"]
+# Allow hand-edits to the generated GitHub Actions workflow (e.g., custom secret names).
+allow-dirty = ["ci"]

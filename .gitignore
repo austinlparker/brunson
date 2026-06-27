@@ -1,0 +1,6 @@
+/target
+.DS_Store
+.polytoken.toml
+render_dump_*.txt
+Screenshot *.png
+screenshot*.png
