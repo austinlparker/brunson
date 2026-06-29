@@ -3,7 +3,21 @@ use reqwest::Client;
 
 use crate::api::*;
 
+#[derive(Debug, Clone)]
+pub struct ConfigReloadError {
+    pub body: String,
+}
+
+impl std::fmt::Display for ConfigReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.body)
+    }
+}
+
+impl std::error::Error for ConfigReloadError {}
+
 /// HTTP client for talking to the daemon API.
+#[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
     client: Client,
@@ -84,5 +98,20 @@ impl DaemonClient {
     #[allow(dead_code)]
     pub async fn classify(&self, id: &str) -> Result<ClassifyResponse> {
         self.post(&format!("/prs/{}/classify", id)).await
+    }
+
+    pub async fn get_setup_status(&self) -> Result<SetupStatusResponse> {
+        self.get("/setup/status").await
+    }
+
+    pub async fn reload_config(&self) -> Result<()> {
+        let url = format!("{}/config/reload", self.base_url);
+        let resp = self.client.post(&url).send().await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(ConfigReloadError { body }.into())
+        }
     }
 }

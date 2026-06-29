@@ -479,6 +479,8 @@ mod tests {
             last_poll_error: None,
             rate_limit_remaining: None,
             refresh_in_progress: false,
+            setup_status: "ready".to_string(),
+            setup_message: None,
         });
         state
     }

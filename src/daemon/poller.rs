@@ -1,4 +1,6 @@
 use std::sync::Arc;
+
+use tokio::sync::watch;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -30,28 +32,55 @@ impl PollState {
 
 /// Run the background polling loop.
 pub async fn run_poll_loop(
-    client: GitHubClient,
+    gh_client: Arc<tokio::sync::RwLock<Option<GitHubClient>>>,
     store: SharedStore,
-    config: Config,
+    config_rx: watch::Receiver<Config>,
     poll_state: Arc<PollState>,
-    classifier: Option<Arc<Classifier>>,
+    classifier: Arc<tokio::sync::RwLock<Option<Arc<Classifier>>>>,
     shutdown: CancellationToken,
 ) {
-    let poll_interval = std::time::Duration::from_secs(config.github.poll_interval.max(60));
-
-    info!(
-        "Poller started with interval {:?}, watch: {:?}",
-        poll_interval, config.github.watch
-    );
+    info!("Poller started");
 
     loop {
+        // Read the latest config at the top of every cycle. This means a
+        // `POST /config/reload` takes effect on the next poll without a restart.
+        let config = config_rx.borrow().clone();
+        let poll_interval = std::time::Duration::from_secs(config.github.poll_interval.max(60));
+
+        // A missing GitHub client is recoverable (the daemon may start before
+        // auth is configured and recover later via `/config/reload`).
+        let client = {
+            let lock = gh_client.read().await;
+            match lock.as_ref() {
+                Some(c) => c.clone(),
+                None => {
+                    warn!("No GitHub client configured; skipping poll cycle");
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {
+                            info!("Poller shutting down");
+                            return;
+                        }
+                        _ = poll_state.refresh_notify.notified() => {
+                            info!("Immediate refresh triggered");
+                            {
+                                let mut s = store.write().await;
+                                s.refresh_in_progress = true;
+                            }
+                        }
+                        _ = tokio::time::sleep(poll_interval) => {}
+                    }
+                    continue;
+                }
+            }
+        };
+
         // Run a poll cycle
         tokio::select! {
             _ = shutdown.cancelled() => {
                 info!("Poller shutting down");
                 return;
             }
-            result = run_poll_cycle(&client, &store, &config, classifier.as_ref()) => {
+            result = run_poll_cycle(&client, &store, &config, &classifier) => {
                 match result {
                     Ok(()) => {}
                     Err(e) => {
@@ -92,7 +121,7 @@ async fn run_poll_cycle(
     client: &GitHubClient,
     store: &SharedStore,
     config: &Config,
-    classifier: Option<&Arc<Classifier>>,
+    classifier: &Arc<tokio::sync::RwLock<Option<Arc<Classifier>>>>,
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
 
@@ -177,11 +206,9 @@ async fn run_poll_cycle(
 
     // LLM classification for changed PRs
     if config.llm.enabled && config.llm.classify_on_change {
+        let maybe_classifier = classifier.read().await.clone();
         for pr in &changed_prs {
-            // Classification happens inline (simple approach)
-            // In production, this would go through the mpsc channel
-            // but for simplicity we handle it directly
-            if let Some(classifier) = classifier {
+            if let Some(classifier) = maybe_classifier.as_ref() {
                 match classifier.classify(pr).await {
                     Ok(result) => {
                         let mut s = store.write().await;

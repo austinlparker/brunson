@@ -1,7 +1,9 @@
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod diff;
 pub mod github;
 pub mod llm;
+pub mod setup;
 pub mod tui;

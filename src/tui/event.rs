@@ -3,6 +3,8 @@ use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::api::{DiffResponse, PrDetailResponse};
+
 /// Events that the TUI event loop processes.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -13,16 +15,15 @@ pub enum TuiEvent {
     DataTick,
     /// Periodic tick for UI updates (every 1s)
     UiTick,
+    /// Result of an asynchronous PR detail fetch.
+    DetailLoaded(String, Box<Result<PrDetailResponse, String>>),
+    /// Result of an asynchronous PR diff fetch.
+    DiffLoaded(String, Result<DiffResponse, String>),
 }
 
-/// Spawn the event producer. Returns a channel receiver for events.
-pub fn spawn_event_loop() -> (
-    mpsc::UnboundedReceiver<TuiEvent>,
-    tokio::task::JoinHandle<()>,
-) {
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    let handle = tokio::spawn(async move {
+/// Spawn the event producer. Events are sent on the supplied channel.
+pub fn spawn_event_loop(event_tx: mpsc::UnboundedSender<TuiEvent>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let mut event_stream = crossterm::event::EventStream::new();
         let mut data_interval = tokio::time::interval(Duration::from_secs(5));
         let mut ui_interval = tokio::time::interval(Duration::from_secs(1));
@@ -33,12 +34,12 @@ pub fn spawn_event_loop() -> (
                 Some(Ok(event)) = event_stream.next() => {
                     match event {
                         CrosstermEvent::Key(key) => {
-                            if tx.send(TuiEvent::Key(key)).is_err() {
+                            if event_tx.send(TuiEvent::Key(key)).is_err() {
                                 break;
                             }
                         }
                         CrosstermEvent::Resize(w, h)
-                            if tx.send(TuiEvent::Resize(w, h)).is_err() => {
+                            if event_tx.send(TuiEvent::Resize(w, h)).is_err() => {
                                 break;
                             }
                         _ => {}
@@ -46,19 +47,17 @@ pub fn spawn_event_loop() -> (
                 }
 
                 _ = data_interval.tick() => {
-                    if tx.send(TuiEvent::DataTick).is_err() {
+                    if event_tx.send(TuiEvent::DataTick).is_err() {
                         break;
                     }
                 }
 
                 _ = ui_interval.tick() => {
-                    if tx.send(TuiEvent::UiTick).is_err() {
+                    if event_tx.send(TuiEvent::UiTick).is_err() {
                         break;
                     }
                 }
             }
         }
-    });
-
-    (rx, handle)
+    })
 }

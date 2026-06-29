@@ -3,6 +3,10 @@ use std::collections::HashMap;
 
 use crate::github::types::{CheckStatus, PrGroup, Priority};
 
+fn default_setup_status() -> String {
+    "unknown".to_string()
+}
+
 /// GET /health
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -14,6 +18,54 @@ pub struct HealthResponse {
     pub last_poll_error: Option<String>,
     pub rate_limit_remaining: Option<u32>,
     pub refresh_in_progress: bool,
+    #[serde(default = "default_setup_status")]
+    pub setup_status: String,
+    #[serde(default)]
+    pub setup_message: Option<String>,
+}
+
+/// GET /setup/status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupStatusResponse {
+    pub ready: bool,
+    pub status: String,
+    pub auth: AuthStatus,
+    pub llm: LlmSetupStatus,
+    pub next_steps: Vec<String>,
+}
+
+impl Default for SetupStatusResponse {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            status: "missing_config".to_string(),
+            auth: AuthStatus::default(),
+            llm: LlmSetupStatus::default(),
+            next_steps: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub resolved: bool,
+    pub source: Option<String>,
+    pub user: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmSetupStatus {
+    pub enabled: bool,
+    pub reachable: Option<bool>,
+    pub model: Option<String>,
+    pub message: Option<String>,
+}
+
+/// POST /config/reload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigReloadResponse {
+    pub reloaded: bool,
+    pub error: Option<String>,
 }
 
 /// GET /prs

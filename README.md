@@ -49,11 +49,11 @@ cargo install --path .
 ## Quick Start
 
 ```bash
-# Initialize config with defaults
-brunson init
+# Interactive setup: writes config, validates GitHub auth, and tests LLM reachability
+brunson setup
 
-# Edit config to watch your repos
-vim ~/.config/brunson/config.toml
+# Non-interactive / agent install: ensure config dir and default config exist
+brunson setup --yes
 
 # Start the daemon (runs in foreground)
 brunson daemon
@@ -62,7 +62,7 @@ brunson daemon
 brunson tui
 ```
 
-The TUI will auto-detect or spawn the daemon if it's not running.
+The TUI will auto-detect or spawn the daemon if it's not running. If the daemon is already running when you finish `brunson setup`, the setup wizard will send `/config/reload` so the new config takes effect immediately.
 
 ## Configuration
 
@@ -79,7 +79,9 @@ kill_on_tui_exit = false  # kill spawned daemon on TUI exit
 
 [llm]
 enabled = false                          # enable LLM classification
-endpoint = "http://localhost:1234/v1"    # LM Studio endpoint
+provider = "lm_studio"                   # "lm_studio" or "openai_compatible"
+endpoint = ""                            # leave empty for provider-specific defaults
+api_key = ""                             # required for most OpenAI-compatible endpoints
 model = ""                               # empty = auto-detect
 classify_on_change = true
 max_output_tokens = 4096  # increase for reasoning-heavy local models
@@ -137,7 +139,7 @@ The daemon serves a local REST API on `127.0.0.1:{port}`. All responses are JSON
 
 ### `GET /health`
 
-Daemon health and status.
+Daemon health and status. Includes setup diagnostics so agents can tell whether the daemon is ready to serve PR data.
 
 ```bash
 curl http://localhost:17890/health
@@ -151,8 +153,26 @@ curl http://localhost:17890/health
   "current_user": "yourname",
   "last_poll_at": "2024-06-24T12:00:00Z",
   "rate_limit_remaining": 4998,
-  "refresh_in_progress": false
+  "refresh_in_progress": false,
+  "setup_status": "ready",
+  "setup_message": null
 }
+```
+
+### `GET /setup/status`
+
+Machine-readable setup diagnostics. Returns `ready`, `status` (`missing_config`, `missing_auth`, `llm_misconfigured`, or `ready`), GitHub auth state, LLM reachability, and actionable `next_steps`.
+
+```bash
+curl http://localhost:17890/setup/status
+```
+
+### `POST /config/reload`
+
+Re-parse `config.toml` from disk and apply all changes (poll interval, watch list, LLM config, etc.) without restarting the daemon.
+
+```bash
+curl -X POST http://localhost:17890/config/reload
 ```
 
 ### `GET /prs`
@@ -218,19 +238,37 @@ Full PR detail responses include a `timeline` array of PR activity events (`comm
 
 ## LLM Classification
 
-When `[llm] enabled = true`, the daemon sends PR context to a local LM Studio instance for priority classification. The classification result (priority: high/medium/low + summary) appears in the TUI and the `/prs` API response.
+When `[llm] enabled = true`, the daemon sends PR context to an OpenAI-compatible endpoint for priority classification. The classification result (priority: high/medium/low + summary) appears in the TUI and the `/prs` API response.
+
+### LM Studio (default)
 
 1. Install and start [LM Studio](https://lmstudio.ai/)
-2. Load a model
+2. Load a model and start the local server
 3. Enable in config:
 
 ```toml
 [llm]
 enabled = true
-endpoint = "http://localhost:1234/v1"
-model = ""  # auto-detects first available model
-max_output_tokens = 4096  # increase for reasoning-heavy local models
+provider = "lm_studio"
+endpoint = ""  # defaults to http://localhost:1234/v1
+api_key = ""   # optional when LM Studio does not require auth
+model = ""     # auto-detects first available model
+max_output_tokens = 4096
 ```
+
+### OpenAI-compatible providers (OpenAI, Azure, Ollama, etc.)
+
+```toml
+[llm]
+enabled = true
+provider = "openai_compatible"
+endpoint = "https://api.openai.com/v1"  # or your proxy / Azure endpoint
+api_key = "$OPENAI_API_KEY"
+model = "gpt-4o-mini"
+max_output_tokens = 4096
+```
+
+The `api_key` is sent as `Authorization: Bearer {api_key}` on every request.
 
 ## Troubleshooting
 

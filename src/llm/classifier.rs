@@ -1,9 +1,13 @@
+use std::fmt;
+use std::str::FromStr;
+
 use anyhow::{anyhow, Result};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::config::LlmConfig;
+use crate::config::{default_endpoint_for_provider, LlmConfig};
 use crate::github::types::{Priority, PullRequest};
 
 const SYSTEM_PROMPT: &str = "You are a PR triage assistant. Classify the following pull request's urgency. \
@@ -20,12 +24,48 @@ pub struct ClassificationResult {
     pub reasoning: String,
 }
 
-/// LM Studio classifier client.
+/// Supported LLM provider targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProvider {
+    LmStudio,
+    OpenAiCompatible,
+}
+
+impl FromStr for LlmProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lm_studio" => Ok(Self::LmStudio),
+            "openai_compatible" => Ok(Self::OpenAiCompatible),
+            _ => Err(anyhow!("Unknown LLM provider: {}", s)),
+        }
+    }
+}
+
+impl fmt::Display for LlmProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LlmProvider::LmStudio => write!(f, "lm_studio"),
+            LlmProvider::OpenAiCompatible => write!(f, "openai_compatible"),
+        }
+    }
+}
+
+/// Resolved provider-level configuration used by the classifier.
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub max_output_tokens: u32,
+}
+
+/// OpenAI-compatible LLM classifier client.
 pub struct Classifier {
     client: Client,
-    endpoint: String,
-    model: String,
-    max_output_tokens: u32,
+    provider: LlmProvider,
+    config: ProviderConfig,
 }
 
 #[derive(Serialize)]
@@ -69,22 +109,54 @@ struct ModelInfo {
 
 impl Classifier {
     pub fn new(config: &LlmConfig) -> Result<Self> {
-        let client = Client::builder().build()?;
-        Ok(Self {
-            client,
-            endpoint: config.endpoint.clone(),
+        let provider: LlmProvider = if config.provider.trim().is_empty() {
+            LlmProvider::LmStudio
+        } else {
+            config.provider.parse()?
+        };
+
+        let endpoint = if config.endpoint.trim().is_empty() {
+            default_endpoint_for_provider(provider.to_string().as_str()).to_string()
+        } else {
+            config.endpoint.clone()
+        };
+
+        let provider_config = ProviderConfig {
+            endpoint,
+            api_key: config.api_key.clone(),
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
+        };
+
+        let mut headers = HeaderMap::new();
+        if !provider_config.api_key.is_empty() {
+            let value = HeaderValue::from_str(&format!("Bearer {}", provider_config.api_key))?;
+            headers.insert(AUTHORIZATION, value);
+        }
+
+        let client = Client::builder().default_headers(headers).build()?;
+        Ok(Self {
+            client,
+            provider,
+            config: provider_config,
         })
+    }
+
+    pub fn provider(&self) -> LlmProvider {
+        self.provider
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        Some(self.config.model.as_str()).filter(|s| !s.is_empty())
     }
 
     /// Auto-detect model name via GET /models if model is empty.
     pub async fn resolve_model(&mut self) -> Result<()> {
-        if !self.model.is_empty() {
+        if !self.config.model.is_empty() {
             return Ok(());
         }
 
-        let url = format!("{}/models", self.endpoint);
+        let url = format!("{}/models", self.config.endpoint);
         debug!("Auto-detecting model from {}", url);
 
         let resp = self.client.get(&url).send().await?;
@@ -94,11 +166,14 @@ impl Classifier {
 
         let models: ModelsResponse = resp.json().await?;
         if let Some(first) = models.data.first() {
-            self.model = first.id.clone();
-            debug!("Auto-detected model: {}", self.model);
+            self.config.model = first.id.clone();
+            debug!("Auto-detected model: {}", self.config.model);
             Ok(())
         } else {
-            Err(anyhow!("No models available at LM Studio endpoint"))
+            Err(anyhow!(
+                "No models available at {} (/models returned empty list)",
+                self.provider
+            ))
         }
     }
 
@@ -135,12 +210,12 @@ impl Classifier {
         content
     }
 
-    /// Classify a PR's urgency via LM Studio.
+    /// Classify a PR's urgency via the configured OpenAI-compatible endpoint.
     pub async fn classify(&self, pr: &PullRequest) -> Result<ClassificationResult> {
         let content = Self::build_pr_content(pr);
 
         let request = ChatRequest {
-            model: self.model.clone(),
+            model: self.config.model.clone(),
             messages: vec![
                 ChatMessage {
                     role: "system".into(),
@@ -152,21 +227,21 @@ impl Classifier {
                 },
             ],
             temperature: 0.0,
-            max_tokens: self.max_output_tokens,
+            max_tokens: self.config.max_output_tokens,
         };
 
-        let url = format!("{}/chat/completions", self.endpoint);
+        let url = format!("{}/chat/completions", self.config.endpoint);
         let resp = self.client.post(&url).json(&request).send().await?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!("LM Studio request failed: {}", resp.status()));
+            return Err(anyhow!("LLM request failed: {}", resp.status()));
         }
 
         let chat_resp: ChatResponse = resp.json().await?;
         let response_text = chat_resp
             .choices
             .first()
-            .ok_or_else(|| anyhow!("No choices in LM Studio response"))?
+            .ok_or_else(|| anyhow!("No choices in LLM response"))?
             .message
             .content
             .clone();
@@ -305,5 +380,59 @@ mod tests {
         let result = parse_classification(text).unwrap();
         // Should fall back to medium
         assert_eq!(result.priority, Priority::Medium);
+    }
+
+    #[test]
+    fn test_provider_parsing() {
+        assert_eq!(
+            "lm_studio".parse::<LlmProvider>().unwrap(),
+            LlmProvider::LmStudio
+        );
+        assert_eq!(
+            "openai_compatible".parse::<LlmProvider>().unwrap(),
+            LlmProvider::OpenAiCompatible
+        );
+        assert!("unknown".parse::<LlmProvider>().is_err());
+    }
+
+    #[test]
+    fn test_classifier_applies_default_endpoint() {
+        let config = LlmConfig {
+            provider: String::new(),
+            endpoint: String::new(),
+            ..Default::default()
+        };
+        let classifier = Classifier::new(&config).unwrap();
+        assert_eq!(classifier.provider(), LlmProvider::LmStudio);
+        // The endpoint is private, but we can exercise a real request in the
+        // integration tests for header injection.
+        assert!(classifier.model().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_classifier_sends_authorization_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("Authorization", "Bearer secret-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = LlmConfig {
+            provider: "openai_compatible".to_string(),
+            endpoint: server.uri(),
+            api_key: "secret-key".to_string(),
+            ..Default::default()
+        };
+
+        let mut classifier = Classifier::new(&config).unwrap();
+        classifier.resolve_model().await.unwrap();
+        assert_eq!(classifier.model(), Some("test-model"));
     }
 }

@@ -5,8 +5,11 @@ The brunson daemon serves a local HTTP API at `http://127.0.0.1:17890` (configur
 ## Quick Start for Agents
 
 ```bash
-# Check daemon health
+# Check daemon health and setup status
 curl -s http://localhost:17890/health | jq
+
+# If setup_status is not "ready", inspect what's missing
+curl -s http://localhost:17890/setup/status | jq
 
 # Get all PRs grouped by state
 curl -s http://localhost:17890/prs | jq
@@ -74,13 +77,52 @@ curl -s http://localhost:17890/health | jq .refresh_in_progress
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Daemon status, current user, rate limit, poll state |
+| GET | `/health` | Daemon status + cached `setup_status`/`setup_message` |
+| GET | `/setup/status` | Full machine-readable setup diagnostics |
+| POST | `/config/reload` | Re-parse `config.toml` from disk and apply changes |
 | GET | `/prs` | All PRs grouped by state |
 | GET | `/prs/{id}` | Full PR detail (checks, comments, files) |
 | GET | `/prs/{id}/diff` | Raw unified diff |
 | POST | `/prs/refresh` | Trigger immediate GitHub poll (returns 202) |
 | POST | `/prs/{id}/classify` | Re-run LLM classification (returns 202 or 503) |
-| GET | `/config` | Effective config (no secrets) |
+| GET | `/config` | Effective config, redacted (no secrets) |
+
+## Agent-Driven Setup Workflow
+
+Agents can bootstrap brunson without human interaction by creating the config file directly and asking the daemon to reload:
+
+```bash
+# 1. Ensure a default config file exists
+brunson setup --yes
+
+# 2. Write the TOML config (stable schema) programmatically, for example:
+cat > ~/.config/brunson/config.toml <<'EOF'
+[github]
+watch = ["myorg", "myorg/important-repo"]
+poll_interval = 300
+
+[daemon]
+port = 17890
+
+[llm]
+enabled = true
+provider = "openai_compatible"
+endpoint = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"
+model = "gpt-4o-mini"
+classify_on_change = true
+max_output_tokens = 4096
+EOF
+
+# 3. If the daemon is already running, ask it to reload
+#    (otherwise it will pick up the config on the next start)
+curl -s -X POST http://localhost:17890/config/reload
+
+# 4. Poll /health until setup_status becomes "ready"
+until [ "$(curl -s http://localhost:17890/health | jq -r .setup_status)" = "ready" ]; do
+  sleep 1
+done
+```
 
 ## TUI Layout (Brunson)
 
@@ -129,7 +171,9 @@ Every component fully paints its allocated area (via `fill`/`Surface`), so no ma
   "last_poll_at": "2024-06-24T12:00:00Z",
   "last_poll_error": null,
   "rate_limit_remaining": 4998,
-  "refresh_in_progress": false
+  "refresh_in_progress": false,
+  "setup_status": "ready",
+  "setup_message": null
 }
 ```
 

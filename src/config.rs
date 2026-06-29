@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -34,8 +34,12 @@ pub struct DaemonConfig {
 pub struct LlmConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_llm_endpoint")]
+    #[serde(default = "default_llm_provider")]
+    pub provider: String,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
+    pub api_key: String,
     #[serde(default)]
     pub model: String,
     #[serde(default = "default_classify_on_change")]
@@ -76,7 +80,9 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: default_llm_endpoint(),
+            provider: default_llm_provider(),
+            endpoint: String::new(),
+            api_key: String::new(),
             model: String::new(),
             classify_on_change: default_classify_on_change(),
             max_output_tokens: default_llm_max_output_tokens(),
@@ -97,26 +103,40 @@ impl Default for TuiConfig {
 fn default_poll_interval() -> u64 {
     300
 }
+
 fn default_port() -> u16 {
     17890
 }
-fn default_llm_endpoint() -> String {
-    "http://localhost:1234/v1".to_string()
+
+fn default_llm_provider() -> String {
+    "lm_studio".to_string()
 }
+
 fn default_classify_on_change() -> bool {
     true
 }
+
 fn default_llm_max_output_tokens() -> u32 {
     4096
 }
+
 fn default_diff_style() -> String {
     "unified".to_string()
 }
+
 fn default_show_line_numbers() -> bool {
     true
 }
+
 fn default_osc8_links() -> bool {
     true
+}
+
+pub fn default_endpoint_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "openai_compatible" => "https://api.openai.com/v1",
+        _ => "http://localhost:1234/v1",
+    }
 }
 
 impl Config {
@@ -126,36 +146,59 @@ impl Config {
             None => config_file_path()?,
         };
 
-        if !config_path.exists() {
-            return Ok(Config::default());
-        }
+        let mut config = if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path).with_context(|| {
+                format!("Failed to read config file: {}", config_path.display())
+            })?;
+            toml::from_str(&content).with_context(|| {
+                format!("Failed to parse config file: {}", config_path.display())
+            })?
+        } else {
+            Config::default()
+        };
 
-        let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-
-        let config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
-
+        config.resolve_llm_defaults();
         config.validate()?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn resolve_llm_defaults(&mut self) {
+        if self.llm.provider.is_empty() {
+            self.llm.provider = default_llm_provider();
+        }
+        if self.llm.endpoint.is_empty() {
+            self.llm.endpoint = default_endpoint_for_provider(&self.llm.provider).to_string();
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.llm.provider.is_empty() {
+            match self.llm.provider.as_str() {
+                "lm_studio" | "openai_compatible" => {}
+                other => {
+                    bail!(
+                        "Invalid llm.provider '{}': expected 'lm_studio' or 'openai_compatible'",
+                        other
+                    );
+                }
+            }
+        }
+
         for entry in &self.github.watch {
             if entry.is_empty() {
-                anyhow::bail!("Watch entry cannot be empty");
+                bail!("Watch entry cannot be empty");
             }
             // Validate: either "org" or "org/repo"
             let parts: Vec<&str> = entry.split('/').collect();
             if parts.len() > 2 {
-                anyhow::bail!(
+                bail!(
                     "Invalid watch entry '{}': expected 'org' or 'org/repo'",
                     entry
                 );
             }
             for part in &parts {
                 if part.is_empty() {
-                    anyhow::bail!("Invalid watch entry '{}': empty segment", entry);
+                    bail!("Invalid watch entry '{}': empty segment", entry);
                 }
             }
         }
@@ -210,10 +253,16 @@ port = 17890
 kill_on_tui_exit = false
 
 [llm]
-# Enable LLM classification via LM Studio
+# Enable LLM classification
 enabled = false
-# LM Studio OpenAI-compatible endpoint
-endpoint = "http://localhost:1234/v1"
+# Provider: "lm_studio" (default) or "openai_compatible"
+provider = "lm_studio"
+# OpenAI-compatible endpoint. Leave empty for provider-specific defaults:
+# lm_studio -> http://localhost:1234/v1
+# openai_compatible -> https://api.openai.com/v1
+endpoint = ""
+# API key. Required for most openai_compatible endpoints; optional for LM Studio.
+api_key = ""
 # Model name (empty = auto-detect via GET /v1/models)
 model = ""
 # Re-classify when a PR changes state
@@ -253,9 +302,65 @@ mod tests {
         assert_eq!(config.github.poll_interval, 300);
         assert_eq!(config.daemon.port, 17890);
         assert!(!config.llm.enabled);
-        assert_eq!(config.llm.endpoint, "http://localhost:1234/v1");
+        assert_eq!(config.llm.provider, "lm_studio");
+        // Empty endpoint resolves to the LM Studio default on load.
+        assert_eq!(config.llm.endpoint, "");
         assert!(config.github.watch.is_empty());
         assert!(config.tui.osc8_links);
+    }
+
+    #[test]
+    fn test_load_resolves_default_endpoint() {
+        let dir = std::env::temp_dir().join("brunson-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("test-config-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[llm]
+enabled = false
+"#,
+        )
+        .unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.llm.provider, "lm_studio");
+        assert_eq!(config.llm.endpoint, "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn test_resolve_llm_defaults_openai() {
+        let mut config = Config::default();
+        config.llm.provider = "openai_compatible".to_string();
+        config.llm.endpoint.clear();
+        config.resolve_llm_defaults();
+        assert_eq!(config.llm.endpoint, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn test_validate_provider() {
+        let mut config = Config::default();
+        config.llm.provider = "lm_studio".to_string();
+        assert!(config.validate().is_ok());
+
+        config.llm.provider = "openai_compatible".to_string();
+        assert!(config.validate().is_ok());
+
+        config.llm.provider = "unknown".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_backward_compat_without_provider_field() {
+        let toml = r#"
+[llm]
+enabled = false
+endpoint = "http://localhost:1234/v1"
+model = ""
+"#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.resolve_llm_defaults();
+        assert_eq!(config.llm.provider, "lm_studio");
+        assert_eq!(config.llm.endpoint, "http://localhost:1234/v1");
     }
 
     #[test]

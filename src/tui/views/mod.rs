@@ -5,3 +5,4 @@ pub mod files;
 pub mod inbox;
 pub mod markdown;
 pub mod overview;
+pub mod setup;

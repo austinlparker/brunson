@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -8,37 +9,62 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use tokio::sync::watch;
 
 use crate::api::*;
-use crate::config::Config;
+use crate::config::{default_endpoint_for_provider, Config};
 use crate::daemon::poller::PollState;
+use crate::daemon::setup_status::{evaluate_setup, SetupAuth, SetupCache};
 use crate::daemon::store::SharedStore;
+use crate::github::auth::{resolve_host, resolve_token};
+use crate::github::client::GitHubClient;
+use crate::github::graphql::fetch_viewer_login;
 use crate::github::types::parse_slug;
 use crate::llm::classifier::Classifier;
 
 /// Shared application state for all handlers.
 pub struct AppState {
     pub store: SharedStore,
-    pub config: Config,
+    pub config_rx: watch::Receiver<Config>,
+    pub config_tx: watch::Sender<Config>,
+    pub config_path: Option<PathBuf>,
     pub poll_state: Arc<PollState>,
-    pub classifier: Option<Arc<Classifier>>,
+    pub classifier: Arc<tokio::sync::RwLock<Option<Arc<Classifier>>>>,
+    pub gh_client: Arc<tokio::sync::RwLock<Option<GitHubClient>>>,
+    pub setup_cache: Arc<tokio::sync::RwLock<SetupCache>>,
+    pub auth: Box<dyn SetupAuth + Send + Sync>,
+}
+
+impl AppState {
+    pub fn latest_config(&self) -> Config {
+        self.config_rx.borrow().clone()
+    }
 }
 
 /// Build the axum router with all routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handle_health))
+        .route("/setup/status", get(handle_setup_status))
+        .route("/config", get(handle_config))
+        .route("/config/reload", post(handle_config_reload))
         .route("/prs", get(handle_prs))
         .route("/prs/refresh", post(handle_refresh))
         .route("/prs/:id", get(handle_pr_detail))
         .route("/prs/:id/diff", get(handle_pr_diff))
         .route("/prs/:id/classify", post(handle_classify))
-        .route("/config", get(handle_config))
         .with_state(state)
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let s = state.store.read().await;
+    let (setup_status, setup_message) = {
+        let cache = state.setup_cache.read().await;
+        (
+            cache.result.status.clone(),
+            cache.result.next_steps.first().cloned(),
+        )
+    };
     Json(HealthResponse {
         service: crate::daemon::SERVICE_NAME.to_string(),
         version: crate::daemon::VERSION.to_string(),
@@ -48,7 +74,33 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
         last_poll_error: s.last_poll_error.clone(),
         rate_limit_remaining: s.rate_limit_remaining,
         refresh_in_progress: s.refresh_in_progress,
+        setup_status,
+        setup_message,
     })
+}
+
+async fn handle_setup_status(State(state): State<Arc<AppState>>) -> Json<SetupStatusResponse> {
+    {
+        let cache = state.setup_cache.read().await;
+        if cache.is_fresh() {
+            return Json(cache.result.clone());
+        }
+    }
+
+    let result = evaluate_setup(
+        &state.latest_config(),
+        state.config_path.as_deref(),
+        state.auth.as_ref(),
+    )
+    .await;
+
+    {
+        let mut cache = state.setup_cache.write().await;
+        cache.cached_at = Some(std::time::Instant::now());
+        cache.result = result.clone();
+    }
+
+    Json(result)
 }
 
 async fn handle_prs(State(state): State<Arc<AppState>>) -> Json<PrListResponse> {
@@ -364,17 +416,28 @@ async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         }
     };
 
-    // Check LLM is enabled
-    let classifier = match &state.classifier {
-        Some(c) => c.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError::service_unavailable(
-                    "LLM classification is not enabled",
-                )),
-            )
-                .into_response();
+    // Check LLM is enabled in the latest config.
+    if !state.latest_config().llm.enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request("LLM classification is disabled")),
+        )
+            .into_response();
+    }
+
+    let classifier = {
+        let c = state.classifier.read().await;
+        match c.as_ref() {
+            Some(classifier) => classifier.clone(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::service_unavailable(
+                        "LLM classification is not available",
+                    )),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -426,27 +489,99 @@ async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<Stri
 
 async fn handle_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // Return sanitized config (no secrets)
-    Json(serde_json::json!({
-        "github": {
-            "watch": state.config.github.watch,
-            "poll_interval": state.config.github.poll_interval,
-        },
-        "daemon": {
-            "port": state.config.daemon.port,
-            "kill_on_tui_exit": state.config.daemon.kill_on_tui_exit,
-        },
-        "llm": {
-            "enabled": state.config.llm.enabled,
-            "endpoint": state.config.llm.endpoint,
-            "model": state.config.llm.model,
-            "classify_on_change": state.config.llm.classify_on_change,
-            "max_output_tokens": state.config.llm.max_output_tokens,
-        },
-        "tui": {
-            "diff_style": state.config.tui.diff_style,
-            "show_line_numbers": state.config.tui.show_line_numbers,
+    let mut config = state.latest_config();
+    config.llm.api_key = "***".to_string();
+    if config.llm.endpoint.is_empty() {
+        config.llm.endpoint = default_endpoint_for_provider(&config.llm.provider).to_string();
+    }
+    let mut value = serde_json::to_value(&config).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        // Drop the tui block from the daemon API response to keep it focused.
+        obj.remove("tui");
+    }
+    Json(value)
+}
+
+async fn handle_config_reload(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<ConfigReloadResponse>) {
+    let reload_path = state
+        .config_path
+        .clone()
+        .unwrap_or_else(|| crate::config::config_file_path().unwrap_or_default());
+
+    if reload_path.as_os_str().is_empty() || !reload_path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ConfigReloadResponse {
+                reloaded: false,
+                error: Some("config file not found".to_string()),
+            }),
+        );
+    }
+
+    let new_config = match Config::load(Some(&reload_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ConfigReloadResponse {
+                    reloaded: false,
+                    error: Some(e.to_string()),
+                }),
+            );
         }
-    }))
+    };
+
+    // Re-resolve GitHub auth in case the user just ran `brunson setup`.
+    if let Ok(token) = resolve_token() {
+        let host = resolve_host();
+        if let Ok(client) = GitHubClient::new(token, Some(host)) {
+            if let Ok(login) = fetch_viewer_login(&client).await {
+                let mut store = state.store.write().await;
+                store.current_user = login;
+            }
+            let mut gh = state.gh_client.write().await;
+            *gh = Some(client);
+        }
+    }
+
+    // Notify all watchers (including the poller) of the new config.
+    let _ = state.config_tx.send(new_config.clone());
+
+    // Rebuild classifier against the new LLM configuration.
+    let classifier = crate::daemon::build_classifier(&new_config.llm).await;
+    {
+        let mut c = state.classifier.write().await;
+        *c = classifier.clone();
+    }
+
+    // Refresh setup cache so /health immediately reflects the new config.
+    let refreshed = evaluate_setup(
+        &new_config,
+        state.config_path.as_deref(),
+        state.auth.as_ref(),
+    )
+    .await;
+    {
+        let mut cache = state.setup_cache.write().await;
+        cache.cached_at = Some(std::time::Instant::now());
+        cache.result = refreshed;
+    }
+
+    let error = if classifier.is_none() && new_config.llm.enabled {
+        Some("config reloaded, but failed to build LLM classifier".to_string())
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(ConfigReloadResponse {
+            reloaded: true,
+            error,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -492,11 +627,17 @@ mod tests {
         let refresh_notify = Arc::new(Notify::new());
         let poll_state = Arc::new(PollState::new(refresh_notify));
         let shared = Arc::new(tokio::sync::RwLock::new(store));
+        let (config_tx, config_rx) = watch::channel(Config::default());
         Arc::new(AppState {
             store: shared,
-            config: Config::default(),
+            config_rx,
+            config_tx,
+            config_path: None,
             poll_state,
-            classifier: None,
+            classifier: Arc::new(tokio::sync::RwLock::new(None)),
+            gh_client: Arc::new(tokio::sync::RwLock::new(None)),
+            setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
+            auth: Box::new(crate::daemon::setup_status::SetupAuthImpl),
         })
     }
 
@@ -629,8 +770,205 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    use futures::future::BoxFuture;
+    use std::io::Write;
     use tokio::sync::Notify;
+
+    struct TestAuth {
+        user: String,
+    }
+
+    impl SetupAuth for TestAuth {
+        fn resolve_token(&self) -> anyhow::Result<String> {
+            Ok("test-token".to_string())
+        }
+
+        fn viewer_login<'a>(
+            &'a self,
+            _token: &'a str,
+            _host: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<String>> {
+            let user = self.user.clone();
+            Box::pin(async move { Ok(user) })
+        }
+    }
+
+    fn make_test_state_with_config(
+        config: Config,
+        config_path: Option<std::path::PathBuf>,
+    ) -> Arc<AppState> {
+        let refresh_notify = Arc::new(Notify::new());
+        let poll_state = Arc::new(PollState::new(refresh_notify));
+        let store = PrStore::new("me".into());
+        let shared = Arc::new(tokio::sync::RwLock::new(store));
+        let (config_tx, config_rx) = watch::channel(config);
+        Arc::new(AppState {
+            store: shared,
+            config_rx,
+            config_tx,
+            config_path,
+            poll_state,
+            classifier: Arc::new(tokio::sync::RwLock::new(None)),
+            gh_client: Arc::new(tokio::sync::RwLock::new(None)),
+            setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
+            auth: Box::new(TestAuth {
+                user: "testuser".into(),
+            }),
+        })
+    }
+
+    fn write_temp_config(toml: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("brunson-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("test-config-{}.toml", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(toml.as_bytes()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_health_includes_setup_status_from_cache() {
+        let store = PrStore::new("me".into());
+        let state = make_test_state(store);
+        {
+            let mut cache = state.setup_cache.write().await;
+            cache.cached_at = Some(std::time::Instant::now());
+            cache.result = SetupStatusResponse {
+                ready: false,
+                status: "missing_auth".to_string(),
+                auth: crate::api::AuthStatus::default(),
+                llm: crate::api::LlmSetupStatus::default(),
+                next_steps: vec!["Run gh auth login".to_string()],
+            };
+        }
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["setup_status"], "missing_auth");
+        assert_eq!(json["setup_message"], "Run gh auth login");
+    }
+
+    #[tokio::test]
+    async fn test_setup_status_reports_ready() {
+        let toml = r#"
+[github]
+watch = []
+poll_interval = 300
+
+[daemon]
+port = 17890
+
+[llm]
+enabled = false
+"#;
+        let path = write_temp_config(toml);
+        let config = Config::load(Some(&path)).unwrap();
+        let state = make_test_state_with_config(config, Some(path));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/setup/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert!(json["ready"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_config_reload_valid_config() {
+        let toml = r#"
+[github]
+watch = []
+poll_interval = 120
+
+[daemon]
+port = 17890
+
+[llm]
+enabled = false
+"#;
+        let path = write_temp_config(toml);
+        let config = Config::load(Some(&path)).unwrap();
+        let initial_interval = config.github.poll_interval;
+        let state = make_test_state_with_config(config, Some(path.clone()));
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reloaded"], true);
+        assert!(json["error"].is_null());
+
+        // The watch channel should now reflect the re-loaded config.
+        assert_eq!(state.latest_config().github.poll_interval, initial_interval);
+    }
+
+    #[tokio::test]
+    async fn test_config_reload_missing_file() {
+        let state = make_test_state_with_config(
+            Config::default(),
+            Some(std::path::PathBuf::from("/nonexistent/brunson-config.toml")),
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reloaded"], false);
+        assert!(!json["error"].is_null());
+    }
 }

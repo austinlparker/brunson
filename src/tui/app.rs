@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
@@ -30,6 +30,8 @@ pub enum Action {
     None,
     Quit,
     Refresh,
+    RunSetup,
+    ReloadConfig,
 }
 
 /// Central TUI application state. This struct holds domain and cache data only —
@@ -37,8 +39,14 @@ pub enum Action {
 pub struct AppState {
     pub config: Config,
     pub client: DaemonClient,
+    /// Original config path passed on the CLI, used to spawn `brunson setup`.
+    pub config_path: Option<PathBuf>,
     pub prs: PrListResponse,
     pub health: Option<HealthResponse>,
+    /// Last fetched daemon setup status.
+    pub setup_status: Option<crate::api::SetupStatusResponse>,
+    /// When true, the setup wizard overlay replaces the dashboard.
+    pub show_setup_wizard: bool,
 
     /// Currently selected PR slug.
     pub selected_pr_id: Option<String>,
@@ -62,6 +70,10 @@ pub struct AppState {
     pub detail_needs_reload: bool,
     /// Tracks whether the diff needs reload.
     pub diff_needs_reload: bool,
+    /// Loading indicator for async detail fetch.
+    pub detail_loading: bool,
+    /// Loading indicator for async diff fetch.
+    pub diff_loading: bool,
     /// Cached render artifacts (overview/activity/diff lines).
     pub render_cache: RenderCache,
 }
@@ -72,11 +84,14 @@ impl AppState {
         Self {
             config,
             client,
+            config_path: None,
             prs: PrListResponse {
                 groups: HashMap::new(),
                 updated_at: String::new(),
             },
             health: None,
+            setup_status: None,
+            show_setup_wizard: false,
             selected_pr_id: None,
             pr_detail: None,
             pr_diff: None,
@@ -88,7 +103,23 @@ impl AppState {
             loading: false,
             detail_needs_reload: false,
             diff_needs_reload: false,
+            detail_loading: false,
+            diff_loading: false,
             render_cache: RenderCache::new(),
+        }
+    }
+
+    /// Fetch setup status from the daemon and update the wizard flag.
+    pub async fn fetch_setup_status(&mut self) {
+        match self.client.get_setup_status().await {
+            Ok(status) => {
+                self.show_setup_wizard = !status.ready;
+                self.setup_status = Some(status);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to fetch setup status: {}", e));
+                self.show_setup_wizard = true;
+            }
         }
     }
 
@@ -249,6 +280,10 @@ impl AppState {
             return self.handle_ctrl_key(view, key);
         }
 
+        if self.show_setup_wizard {
+            return self.handle_setup_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Quit,
             KeyCode::Char('R') => {
@@ -320,6 +355,20 @@ impl AppState {
             _ => {}
         }
         Action::None
+    }
+
+    fn handle_setup_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
+            KeyCode::Char('s') | KeyCode::Char('S') => Action::RunSetup,
+            KeyCode::Char('R') => Action::ReloadConfig,
+            KeyCode::Char('?') => {
+                self.error_message =
+                    Some("Setup overlay keys: s run setup, R reload config, q quit".to_string());
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     fn handle_ctrl_key(&mut self, view: &mut ViewStateManager, key: KeyEvent) -> Action {
@@ -474,8 +523,12 @@ pub async fn run_tui_with_config_path(config: Config, config_path: Option<PathBu
 
     let mut state = AppState::new(config, client);
     state.daemon_child = daemon_child;
+    state.config_path = config_path.clone();
 
-    state.refresh_data().await;
+    state.fetch_setup_status().await;
+    if !state.show_setup_wizard {
+        state.refresh_data().await;
+    }
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -582,6 +635,11 @@ async fn ensure_daemon(
 pub fn render_frame(f: &mut ratatui::Frame, state: &mut AppState, view: &mut ViewStateManager) {
     let area = f.area();
 
+    if state.show_setup_wizard {
+        crate::tui::views::setup::render_setup_wizard(f, area, state);
+        return;
+    }
+
     // RootLayout::render fills the whole terminal with BASE, so every cell is
     // painted explicitly — no manual clear_area / skip-flag reset is needed.
     let layout = RootLayout::new(view.view.active_blade).render(f, area);
@@ -615,16 +673,35 @@ async fn run_render_loop(
     terminal: &mut ratatui::DefaultTerminal,
     state: &mut AppState,
 ) -> Result<()> {
-    let (mut event_rx, event_handle) = spawn_event_loop();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_handle = spawn_event_loop(event_tx.clone());
     let mut view = ViewStateManager::new();
 
     loop {
+        // Start async detail/diff fetches instead of blocking the render loop.
         if state.detail_needs_reload {
-            state.load_detail().await;
+            if let Some(id) = state.selected_pr_id.clone() {
+                let tx = event_tx.clone();
+                let client = state.client.clone();
+                tokio::spawn(async move {
+                    let res = client.get_pr_detail(&id).await.map_err(|e| e.to_string());
+                    let _ = tx.send(TuiEvent::DetailLoaded(id, Box::new(res)));
+                });
+                state.detail_loading = true;
+            }
+            state.detail_needs_reload = false;
         }
         if state.diff_needs_reload {
-            state.load_diff().await;
-            state.scroll_diff_to_selected_file(&mut view);
+            if let Some(id) = state.selected_pr_id.clone() {
+                let tx = event_tx.clone();
+                let client = state.client.clone();
+                tokio::spawn(async move {
+                    let res = client.get_pr_diff(&id).await.map_err(|e| e.to_string());
+                    let _ = tx.send(TuiEvent::DiffLoaded(id, res));
+                });
+                state.diff_loading = true;
+            }
+            state.diff_needs_reload = false;
         }
 
         terminal.draw(|f| render_frame(f, state, &mut view))?;
@@ -645,8 +722,59 @@ async fn run_render_loop(
                         state.refresh_data().await;
                         state.loading = false;
                     }
+                    Action::ReloadConfig => match state.client.reload_config().await {
+                        Ok(()) => {
+                            state.fetch_setup_status().await;
+                            if !state.show_setup_wizard {
+                                state.refresh_data().await;
+                            }
+                        }
+                        Err(e) => {
+                            state.error_message = Some(format!("Failed to reload config: {}", e));
+                        }
+                    },
+                    Action::RunSetup => {
+                        // Suspend the terminal so the interactive brunson setup
+                        // subprocess can take over stdin/stdout.
+                        let _ = disable_raw_mode();
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.execute(LeaveAlternateScreen);
+                        let _ = stdout.execute(Show);
+
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("brunson"));
+                        let mut cmd = Command::new(&exe);
+                        cmd.arg("setup");
+                        if let Some(ref path) = state.config_path {
+                            cmd.arg("--config").arg(path);
+                        }
+                        match cmd.status() {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => {
+                                state.error_message =
+                                    Some(format!("`brunson setup` exited with {}", status));
+                            }
+                            Err(e) => {
+                                state.error_message =
+                                    Some(format!("Failed to run `brunson setup`: {}", e));
+                            }
+                        }
+
+                        let _ = enable_raw_mode();
+                        let mut stdout = std::io::stdout();
+                        let _ = stdout.execute(EnterAlternateScreen);
+                        let _ = stdout.execute(Hide);
+
+                        // Always ask the daemon to reload in case setup wrote a new
+                        // config file.
+                        let _ = state.client.reload_config().await;
+                        state.fetch_setup_status().await;
+                        if !state.show_setup_wizard {
+                            state.refresh_data().await;
+                        }
+                    }
                     Action::None => {
-                        if state.loading {
+                        if state.loading && !state.show_setup_wizard {
                             state.trigger_refresh().await;
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             state.refresh_data().await;
@@ -657,9 +785,42 @@ async fn run_render_loop(
             }
             TuiEvent::Resize(_, _) => {}
             TuiEvent::DataTick => {
-                state.refresh_data().await;
+                if !state.show_setup_wizard {
+                    state.refresh_data().await;
+                }
             }
             TuiEvent::UiTick => {}
+            TuiEvent::DetailLoaded(id, result) => {
+                state.detail_loading = false;
+                if state.selected_pr_id.as_ref() == Some(&id) {
+                    match *result {
+                        Ok(detail) => state.pr_detail = Some(detail),
+                        Err(e) => {
+                            state.error_message = Some(format!("Failed to load detail: {}", e))
+                        }
+                    }
+                }
+            }
+            TuiEvent::DiffLoaded(id, result) => {
+                state.diff_loading = false;
+                if state.selected_pr_id.as_ref() == Some(&id) {
+                    match result {
+                        Ok(diff_resp) => {
+                            state.diff_lines = crate::diff::render::parse_diff(&diff_resp.diff);
+                            state.pr_diff = Some(diff_resp);
+                            if let Some(detail) = &state.pr_detail {
+                                state.diff_comments =
+                                    crate::diff::render::map_review_threads_to_diff_indices(
+                                        &detail.review_threads,
+                                        &state.diff_lines,
+                                    );
+                            }
+                            state.scroll_diff_to_selected_file(&mut view);
+                        }
+                        Err(e) => state.error_message = Some(format!("Failed to load diff: {}", e)),
+                    }
+                }
+            }
         }
     }
 
@@ -689,6 +850,8 @@ mod tests {
             last_poll_error: None,
             rate_limit_remaining: None,
             refresh_in_progress: false,
+            setup_status: "ready".to_string(),
+            setup_message: None,
         });
         state
     }
