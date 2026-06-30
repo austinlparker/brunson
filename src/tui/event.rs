@@ -3,10 +3,20 @@ use futures::StreamExt;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::api::{DiffResponse, PrDetailResponse};
+use crate::api::{
+    DiffResponse, HealthResponse, PrDetailResponse, PrListResponse, SetupStatusResponse,
+};
+use crate::config::Config;
+
+pub struct StartupLoad {
+    pub daemon_child: Option<std::process::Child>,
+    pub setup_status: SetupStatusResponse,
+    pub config: Config,
+    pub prs: PrListResponse,
+    pub health: Option<HealthResponse>,
+}
 
 /// Events that the TUI event loop processes.
-#[derive(Debug)]
 #[allow(dead_code)]
 pub enum TuiEvent {
     Key(KeyEvent),
@@ -15,6 +25,8 @@ pub enum TuiEvent {
     DataTick,
     /// Periodic tick for UI updates (every 1s)
     UiTick,
+    /// Result of asynchronous startup loading.
+    StartupLoaded(Box<Result<StartupLoad, String>>),
     /// Result of an asynchronous PR detail fetch.
     DetailLoaded(String, Box<Result<PrDetailResponse, String>>),
     /// Result of an asynchronous PR diff fetch.

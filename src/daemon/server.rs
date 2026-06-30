@@ -16,9 +16,7 @@ use crate::config::{default_endpoint_for_provider, Config};
 use crate::daemon::poller::PollState;
 use crate::daemon::setup_status::{evaluate_setup, SetupAuth, SetupCache};
 use crate::daemon::store::SharedStore;
-use crate::github::auth::{resolve_host, resolve_token};
 use crate::github::client::GitHubClient;
-use crate::github::graphql::fetch_viewer_login;
 use crate::github::types::parse_slug;
 use crate::llm::classifier::Classifier;
 
@@ -47,6 +45,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(handle_health))
         .route("/setup/status", get(handle_setup_status))
         .route("/config", get(handle_config))
+        .route("/config/preview", get(handle_config_preview))
+        .route("/config/validate", post(handle_config_validate))
         .route("/config/reload", post(handle_config_reload))
         .route("/prs", get(handle_prs))
         .route("/prs/refresh", post(handle_refresh))
@@ -302,35 +302,19 @@ async fn handle_pr_diff(State(state): State<Arc<AppState>>, Path(id): Path<Strin
         }
     }
 
-    // Fetch diff from GitHub
-    // We need the GitHub client — reconstruct from config
-    let token = match crate::github::auth::resolve_token() {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError::service_unavailable(format!(
-                    "Cannot fetch diff: {}",
-                    e
-                ))),
-            )
-                .into_response();
-        }
-    };
-
-    let host = crate::github::auth::resolve_host();
-    let client = match crate::github::client::GitHubClient::new(token, Some(host)) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    code: "internal_error".to_string(),
-                    message: e.to_string(),
-                    retryable: false,
-                }),
-            )
-                .into_response();
+    let client = {
+        let gh = state.gh_client.read().await;
+        match gh.as_ref() {
+            Some(client) => client.clone(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::service_unavailable(
+                        "Cannot fetch diff: GitHub auth/client is not available",
+                    )),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -377,7 +361,20 @@ async fn handle_pr_diff(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     }
 }
 
-async fn handle_refresh(State(state): State<Arc<AppState>>) -> (StatusCode, Json<RefreshResponse>) {
+async fn handle_refresh(State(state): State<Arc<AppState>>) -> Response {
+    {
+        let gh = state.gh_client.read().await;
+        if gh.is_none() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "Cannot refresh: GitHub auth/client is not available",
+                )),
+            )
+                .into_response();
+        }
+    }
+
     // Check if refresh is already running
     let already_running = {
         let s = state.store.read().await;
@@ -390,18 +387,23 @@ async fn handle_refresh(State(state): State<Arc<AppState>>) -> (StatusCode, Json
             Json(RefreshResponse {
                 refresh_in_progress: true,
             }),
-        );
+        )
+            .into_response();
     }
 
-    // Trigger refresh
+    {
+        let mut s = state.store.write().await;
+        s.refresh_in_progress = true;
+    }
     state.poll_state.trigger_refresh();
 
     (
         StatusCode::ACCEPTED,
         Json(RefreshResponse {
-            refresh_in_progress: false,
+            refresh_in_progress: true,
         }),
     )
+        .into_response()
 }
 
 async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -490,16 +492,40 @@ async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<Stri
 async fn handle_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // Return sanitized config (no secrets)
     let mut config = state.latest_config();
-    config.llm.api_key = "***".to_string();
+    if !config.llm.api_key.is_empty() {
+        config.llm.api_key = "***".to_string();
+    }
     if config.llm.endpoint.is_empty() {
         config.llm.endpoint = default_endpoint_for_provider(&config.llm.provider).to_string();
     }
-    let mut value = serde_json::to_value(&config).unwrap_or_default();
-    if let Some(obj) = value.as_object_mut() {
-        // Drop the tui block from the daemon API response to keep it focused.
-        obj.remove("tui");
+    Json(serde_json::to_value(&config).unwrap_or_default())
+}
+
+async fn handle_config_preview(State(state): State<Arc<AppState>>) -> Json<ConfigPreviewResponse> {
+    let config = state.latest_config();
+    Json(ConfigPreviewResponse {
+        queries: crate::github::search::build_queries_for_config(&config.github),
+    })
+}
+
+async fn handle_config_validate(Json(mut config): Json<Config>) -> Json<ConfigValidateResponse> {
+    config.resolve_llm_defaults();
+    match config.validate() {
+        Ok(()) => Json(ConfigValidateResponse {
+            valid: true,
+            error: None,
+            preview: ConfigPreviewResponse {
+                queries: crate::github::search::build_queries_for_config(&config.github),
+            },
+        }),
+        Err(e) => Json(ConfigValidateResponse {
+            valid: false,
+            error: Some(e.to_string()),
+            preview: ConfigPreviewResponse {
+                queries: Vec::new(),
+            },
+        }),
     }
-    Json(value)
 }
 
 async fn handle_config_reload(
@@ -533,16 +559,29 @@ async fn handle_config_reload(
         }
     };
 
+    let mut errors = Vec::new();
+
     // Re-resolve GitHub auth in case the user just ran `brunson setup`.
-    if let Ok(token) = resolve_token() {
-        let host = resolve_host();
-        if let Ok(client) = GitHubClient::new(token, Some(host)) {
-            if let Ok(login) = fetch_viewer_login(&client).await {
+    match crate::daemon::resolve_github_client_and_user(state.auth.as_ref()).await {
+        Ok((client, login)) => {
+            {
                 let mut store = state.store.write().await;
                 store.current_user = login;
             }
             let mut gh = state.gh_client.write().await;
             *gh = Some(client);
+        }
+        Err(e) => {
+            let msg = format!("GitHub auth/client unavailable after reload: {}", e);
+            {
+                let mut store = state.store.write().await;
+                store.current_user = "unknown".to_string();
+                store.last_poll_error = Some(msg.clone());
+                store.refresh_in_progress = false;
+            }
+            let mut gh = state.gh_client.write().await;
+            *gh = None;
+            errors.push(msg);
         }
     }
 
@@ -569,17 +608,19 @@ async fn handle_config_reload(
         cache.result = refreshed;
     }
 
-    let error = if classifier.is_none() && new_config.llm.enabled {
-        Some("config reloaded, but failed to build LLM classifier".to_string())
-    } else {
-        None
-    };
+    if classifier.is_none() && new_config.llm.enabled {
+        errors.push("config reloaded, but failed to build LLM classifier".to_string());
+    }
 
     (
         StatusCode::OK,
         Json(ConfigReloadResponse {
             reloaded: true,
-            error,
+            error: if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join("; "))
+            },
         }),
     )
 }
@@ -624,10 +665,14 @@ mod tests {
     }
 
     fn make_test_state(store: PrStore) -> Arc<AppState> {
+        make_test_state_with_store_config(store, Config::default())
+    }
+
+    fn make_test_state_with_store_config(store: PrStore, config: Config) -> Arc<AppState> {
         let refresh_notify = Arc::new(Notify::new());
         let poll_state = Arc::new(PollState::new(refresh_notify));
         let shared = Arc::new(tokio::sync::RwLock::new(store));
-        let (config_tx, config_rx) = watch::channel(Config::default());
+        let (config_tx, config_rx) = watch::channel(config);
         Arc::new(AppState {
             store: shared,
             config_rx,
@@ -665,6 +710,105 @@ mod tests {
         assert_eq!(json["service"], crate::daemon::SERVICE_NAME);
         assert_eq!(json["status"], "ok");
         assert_eq!(json["current_user"], "testuser");
+    }
+
+    #[tokio::test]
+    async fn test_config_preview_endpoint() {
+        let mut config = Config::default();
+        config.github.targets.push(crate::config::GithubTarget {
+            repo: Some("myorg/repo".to_string()),
+            team_review_requests: vec!["myorg/team".to_string()],
+            include_authored: false,
+            ..Default::default()
+        });
+        let state = make_test_state_with_store_config(PrStore::new("me".into()), config);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/config/preview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: ConfigPreviewResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.queries.len(), 2);
+        assert!(json
+            .queries
+            .iter()
+            .any(|q| q == "user-review-requested:@me is:pr is:open repo:myorg/repo"));
+        assert!(json
+            .queries
+            .iter()
+            .any(|q| q == "team-review-requested:myorg/team is:pr is:open repo:myorg/repo"));
+    }
+
+    #[tokio::test]
+    async fn test_config_validate_endpoint_rejects_invalid_target() {
+        let mut config = Config::default();
+        config.github.targets.push(crate::config::GithubTarget {
+            org: Some("myorg".to_string()),
+            repo: Some("myorg/repo".to_string()),
+            ..Default::default()
+        });
+        let body = serde_json::to_vec(&config).unwrap();
+        let state = make_test_state(PrStore::new("me".into()));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: ConfigValidateResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!json.valid);
+        assert!(json.error.unwrap().contains("cannot set both"));
+        assert!(json.preview.queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_config_endpoint_includes_tui_and_redacts_nonempty_secret() {
+        let mut config = Config::default();
+        config.llm.api_key = "secret".to_string();
+        config.tui.show_line_numbers = false;
+        let state = make_test_state_with_store_config(PrStore::new("me".into()), config);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["llm"]["api_key"], "***");
+        assert_eq!(json["tui"]["show_line_numbers"], false);
     }
 
     #[tokio::test]
@@ -773,16 +917,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn test_refresh_without_github_client_returns_503() {
+        let store = PrStore::new("me".into());
+        let state = make_test_state(store);
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prs/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let store = state.store.read().await;
+        assert!(!store.refresh_in_progress);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_with_github_client_marks_in_progress() {
+        let store = PrStore::new("me".into());
+        let state = make_test_state(store);
+        {
+            let mut gh = state.gh_client.write().await;
+            *gh = Some(
+                GitHubClient::new("test-token".to_string(), Some("github.com".to_string()))
+                    .unwrap(),
+            );
+        }
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prs/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["refresh_in_progress"], true);
+        let store = state.store.read().await;
+        assert!(store.refresh_in_progress);
+    }
+
     use futures::future::BoxFuture;
     use std::io::Write;
     use tokio::sync::Notify;
 
     struct TestAuth {
         user: String,
+        fail_token: bool,
+        fail_login: bool,
     }
 
     impl SetupAuth for TestAuth {
         fn resolve_token(&self) -> anyhow::Result<String> {
+            if self.fail_token {
+                anyhow::bail!("test token failure");
+            }
             Ok("test-token".to_string())
         }
 
@@ -792,7 +997,13 @@ mod tests {
             _host: &'a str,
         ) -> BoxFuture<'a, anyhow::Result<String>> {
             let user = self.user.clone();
-            Box::pin(async move { Ok(user) })
+            let fail_login = self.fail_login;
+            Box::pin(async move {
+                if fail_login {
+                    anyhow::bail!("test viewer failure");
+                }
+                Ok(user)
+            })
         }
     }
 
@@ -816,14 +1027,47 @@ mod tests {
             setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
             auth: Box::new(TestAuth {
                 user: "testuser".into(),
+                fail_token: false,
+                fail_login: false,
             }),
+        })
+    }
+
+    fn make_test_state_with_auth(
+        config: Config,
+        config_path: Option<std::path::PathBuf>,
+        auth: Box<dyn SetupAuth + Send + Sync>,
+    ) -> Arc<AppState> {
+        let refresh_notify = Arc::new(Notify::new());
+        let poll_state = Arc::new(PollState::new(refresh_notify));
+        let store = PrStore::new("me".into());
+        let shared = Arc::new(tokio::sync::RwLock::new(store));
+        let (config_tx, config_rx) = watch::channel(config);
+        Arc::new(AppState {
+            store: shared,
+            config_rx,
+            config_tx,
+            config_path,
+            poll_state,
+            classifier: Arc::new(tokio::sync::RwLock::new(None)),
+            gh_client: Arc::new(tokio::sync::RwLock::new(None)),
+            setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
+            auth,
         })
     }
 
     fn write_temp_config(toml: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("brunson-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("test-config-{}.toml", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!(
+            "test-config-{}-{}.toml",
+            std::process::id(),
+            unique
+        ));
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(toml.as_bytes()).unwrap();
         path
@@ -942,6 +1186,69 @@ enabled = false
 
         // The watch channel should now reflect the re-loaded config.
         assert_eq!(state.latest_config().github.poll_interval, initial_interval);
+    }
+
+    #[tokio::test]
+    async fn test_config_reload_auth_failure_clears_stale_client() {
+        let toml = r#"
+[github]
+watch = []
+poll_interval = 120
+
+[daemon]
+port = 17890
+
+[llm]
+enabled = false
+"#;
+        let path = write_temp_config(toml);
+        let config = Config::load(Some(&path)).unwrap();
+        let state = make_test_state_with_auth(
+            config,
+            Some(path),
+            Box::new(TestAuth {
+                user: "newuser".into(),
+                fail_token: true,
+                fail_login: false,
+            }),
+        );
+        {
+            let mut store = state.store.write().await;
+            store.current_user = "olduser".to_string();
+        }
+        {
+            let mut gh = state.gh_client.write().await;
+            *gh = Some(
+                GitHubClient::new("old-token".to_string(), Some("github.com".to_string())).unwrap(),
+            );
+        }
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reloaded"], true);
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("GitHub auth/client unavailable"));
+        assert!(state.gh_client.read().await.is_none());
+        let store = state.store.read().await;
+        assert_eq!(store.current_user, "unknown");
+        assert!(store.last_poll_error.is_some());
     }
 
     #[tokio::test]

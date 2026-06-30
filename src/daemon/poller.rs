@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use tokio::sync::watch;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -9,7 +11,7 @@ use crate::config::Config;
 use crate::daemon::store::SharedStore;
 use crate::github::client::GitHubClient;
 use crate::github::graphql::fetch_pr_details;
-use crate::github::search::{build_queries, dedup_results};
+use crate::github::search::{build_queries_for_config, dedup_results, filter_results_for_config};
 use crate::github::types::PullRequest;
 use crate::llm::classifier::Classifier;
 
@@ -55,6 +57,11 @@ pub async fn run_poll_loop(
                 Some(c) => c.clone(),
                 None => {
                     warn!("No GitHub client configured; skipping poll cycle");
+                    {
+                        let mut s = store.write().await;
+                        s.refresh_in_progress = false;
+                        s.last_poll_error = Some("GitHub auth/client is not available".to_string());
+                    }
                     tokio::select! {
                         _ = shutdown.cancelled() => {
                             info!("Poller shutting down");
@@ -62,10 +69,6 @@ pub async fn run_poll_loop(
                         }
                         _ = poll_state.refresh_notify.notified() => {
                             info!("Immediate refresh triggered");
-                            {
-                                let mut s = store.write().await;
-                                s.refresh_in_progress = true;
-                            }
                         }
                         _ = tokio::time::sleep(poll_interval) => {}
                     }
@@ -135,7 +138,7 @@ async fn run_poll_cycle(
     // clear refresh_in_progress before returning, even on error.
     let fetch_result: anyhow::Result<Vec<PullRequest>> = async {
         // Build and run search queries
-        let queries = build_queries(&config.github.watch);
+        let queries = build_queries_for_config(&config.github);
         let mut all_results = Vec::new();
         let mut search_errors = 0;
         let total_queries = queries.len();
@@ -168,7 +171,7 @@ async fn run_poll_cycle(
         }
 
         // De-duplicate
-        let results = dedup_results(all_results);
+        let results = filter_results_for_config(dedup_results(all_results), &config.github);
 
         info!(
             "Found {} unique PRs from {} queries",
@@ -204,11 +207,21 @@ async fn run_poll_cycle(
         changed
     };
 
-    // LLM classification for changed PRs
+    // LLM classification for changed PRs and unclassified PRs. The latter
+    // matters when LLM gets enabled after a store already has PRs loaded.
     if config.llm.enabled && config.llm.classify_on_change {
         let maybe_classifier = classifier.read().await.clone();
-        for pr in &changed_prs {
-            if let Some(classifier) = maybe_classifier.as_ref() {
+        if let Some(classifier) = maybe_classifier.as_ref() {
+            let classify_prs = {
+                let s = store.read().await;
+                llm_classification_candidates(&changed_prs, s.prs.values())
+            };
+
+            if !classify_prs.is_empty() {
+                info!("Classifying {} PRs with LLM", classify_prs.len());
+            }
+
+            for pr in &classify_prs {
                 match classifier.classify(pr).await {
                     Ok(result) => {
                         let mut s = store.write().await;
@@ -222,10 +235,102 @@ async fn run_poll_cycle(
                     }
                 }
             }
+        } else {
+            warn!("LLM classification is enabled but no classifier is available");
         }
     }
 
     info!("Poll cycle completed in {:?}", start.elapsed());
 
     Ok(())
+}
+
+fn llm_classification_candidates<'a>(
+    changed_prs: &[PullRequest],
+    stored_prs: impl Iterator<Item = &'a PullRequest>,
+) -> Vec<PullRequest> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for pr in changed_prs {
+        if seen.insert(pr.node_id.clone()) {
+            candidates.push(pr.clone());
+        }
+    }
+
+    for pr in stored_prs {
+        let needs_classification = pr.llm_priority.is_none() || pr.llm_summary.is_none();
+        if needs_classification && seen.insert(pr.node_id.clone()) {
+            candidates.push(pr.clone());
+        }
+    }
+
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::types::{
+        CheckStatus, MergeableState, Priority, PullRequest, ReviewDecision,
+    };
+
+    #[test]
+    fn llm_candidates_include_missing_classification() {
+        let classified = make_pr("classified", Some(Priority::Low), Some("done"));
+        let missing_priority = make_pr("missing-priority", None, Some("summary"));
+        let missing_summary = make_pr("missing-summary", Some(Priority::High), None);
+
+        let candidates = llm_classification_candidates(
+            &[],
+            [&classified, &missing_priority, &missing_summary].into_iter(),
+        );
+
+        let ids: Vec<_> = candidates.iter().map(|pr| pr.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["missing-priority", "missing-summary"]);
+    }
+
+    #[test]
+    fn llm_candidates_include_changed_even_when_classified() {
+        let changed = make_pr("changed", Some(Priority::Low), Some("done"));
+        let unchanged = make_pr("unchanged", Some(Priority::Medium), Some("done"));
+
+        let candidates = llm_classification_candidates(
+            std::slice::from_ref(&changed),
+            [&changed, &unchanged].into_iter(),
+        );
+
+        let ids: Vec<_> = candidates.iter().map(|pr| pr.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["changed"]);
+    }
+
+    fn make_pr(node_id: &str, priority: Option<Priority>, summary: Option<&str>) -> PullRequest {
+        PullRequest {
+            node_id: node_id.to_string(),
+            number: 1,
+            title: "Test".to_string(),
+            body: String::new(),
+            url: "https://example.com".to_string(),
+            author: "author".to_string(),
+            owner: "owner".to_string(),
+            repo: "repo".to_string(),
+            is_draft: false,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            mergeable: MergeableState::Unknown,
+            review_decision: None::<ReviewDecision>,
+            review_requests: Vec::new(),
+            viewer_latest_review: None,
+            latest_reviews: Vec::new(),
+            check_status: CheckStatus::None,
+            checks: Vec::new(),
+            review_threads: Vec::new(),
+            timeline: Vec::new(),
+            files: Vec::new(),
+            comments: 0,
+            llm_priority: priority,
+            llm_summary: summary.map(str::to_string),
+        }
+    }
 }

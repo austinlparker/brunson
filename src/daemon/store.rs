@@ -44,6 +44,8 @@ impl PrStore {
 
                 // Check if updated_at changed
                 if existing.updated_at != pr.updated_at {
+                    self.cached_diffs.remove(&existing.slug());
+                    self.cached_diffs.remove(&pr.slug());
                     changed.push(pr.clone());
                 }
             } else {
@@ -53,8 +55,23 @@ impl PrStore {
             self.prs.insert(pr.node_id.clone(), pr);
         }
 
-        // Remove PRs that are no longer in the search results
+        // Remove PRs that are no longer in the search results, and drop their
+        // cached diffs so a future PR with the same slug cannot inherit stale data.
+        let removed_slugs: Vec<String> = self
+            .prs
+            .iter()
+            .filter_map(|(key, pr)| {
+                if seen_keys.contains(key) {
+                    None
+                } else {
+                    Some(pr.slug())
+                }
+            })
+            .collect();
         self.prs.retain(|key, _| seen_keys.contains(key));
+        for slug in removed_slugs {
+            self.cached_diffs.remove(&slug);
+        }
 
         changed
     }
@@ -715,6 +732,90 @@ mod tests {
         assert_eq!(found.unwrap().number, 42);
 
         assert!(store.get_by_slug("org~repo~99").is_none());
+    }
+
+    #[test]
+    fn test_changed_pr_invalidates_cached_diff() {
+        let mut store = PrStore::new("me".into());
+        let pr = make_pr(
+            "1",
+            42,
+            "other",
+            false,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            "2024-01-01T00:00:00Z",
+        );
+        store.update_prs(vec![pr]);
+        store.set_diff("org~repo~42".to_string(), "old diff".to_string());
+
+        let updated = make_pr(
+            "1",
+            42,
+            "other",
+            false,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            "2024-01-02T00:00:00Z",
+        );
+        store.update_prs(vec![updated]);
+
+        assert!(store.get_diff("org~repo~42").is_none());
+    }
+
+    #[test]
+    fn test_removed_pr_invalidates_cached_diff() {
+        let mut store = PrStore::new("me".into());
+        let pr = make_pr(
+            "1",
+            42,
+            "other",
+            false,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            "2024-01-01T00:00:00Z",
+        );
+        store.update_prs(vec![pr]);
+        store.set_diff("org~repo~42".to_string(), "old diff".to_string());
+
+        store.update_prs(vec![]);
+
+        assert!(store.get_diff("org~repo~42").is_none());
+    }
+
+    #[test]
+    fn test_unchanged_pr_preserves_cached_diff() {
+        let mut store = PrStore::new("me".into());
+        let pr = make_pr(
+            "1",
+            42,
+            "other",
+            false,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            "2024-01-01T00:00:00Z",
+        );
+        store.update_prs(vec![pr.clone()]);
+        store.set_diff("org~repo~42".to_string(), "old diff".to_string());
+
+        store.update_prs(vec![pr]);
+
+        assert_eq!(
+            store.get_diff("org~repo~42").map(String::as_str),
+            Some("old diff")
+        );
     }
 
     #[test]

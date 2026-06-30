@@ -150,8 +150,18 @@ impl GitHubClient {
 
     /// Send a GraphQL query.
     pub async fn graphql(&self, query: &str) -> Result<serde_json::Value> {
+        self.graphql_with_variables(query, serde_json::json!({}))
+            .await
+    }
+
+    /// Send a GraphQL query with variables.
+    pub async fn graphql_with_variables(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let url = self.graphql_base.clone();
-        let body = serde_json::json!({ "query": query });
+        let body = serde_json::json!({ "query": query, "variables": variables });
 
         let resp = self
             .client

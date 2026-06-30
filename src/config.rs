@@ -18,8 +18,26 @@ pub struct Config {
 pub struct GithubConfig {
     #[serde(default)]
     pub watch: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<GithubTarget>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubTarget {
+    #[serde(default)]
+    pub org: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default = "default_true")]
+    pub direct_review_requests: bool,
+    #[serde(default)]
+    pub team_review_requests: Vec<String>,
+    #[serde(default = "default_true")]
+    pub include_authored: bool,
+    #[serde(default)]
+    pub include_involved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,15 +72,27 @@ pub struct TuiConfig {
     pub diff_style: String,
     #[serde(default = "default_show_line_numbers")]
     pub show_line_numbers: bool,
-    #[serde(default = "default_osc8_links")]
-    pub osc8_links: bool,
 }
 
 impl Default for GithubConfig {
     fn default() -> Self {
         Self {
             watch: Vec::new(),
+            targets: Vec::new(),
             poll_interval: default_poll_interval(),
+        }
+    }
+}
+
+impl Default for GithubTarget {
+    fn default() -> Self {
+        Self {
+            org: None,
+            repo: None,
+            direct_review_requests: true,
+            team_review_requests: Vec::new(),
+            include_authored: true,
+            include_involved: false,
         }
     }
 }
@@ -95,7 +125,6 @@ impl Default for TuiConfig {
         Self {
             diff_style: default_diff_style(),
             show_line_numbers: default_show_line_numbers(),
-            osc8_links: default_osc8_links(),
         }
     }
 }
@@ -128,7 +157,7 @@ fn default_show_line_numbers() -> bool {
     true
 }
 
-fn default_osc8_links() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -185,25 +214,69 @@ impl Config {
         }
 
         for entry in &self.github.watch {
-            if entry.is_empty() {
-                bail!("Watch entry cannot be empty");
+            validate_scope_entry(entry, "watch entry")?;
+        }
+
+        for target in &self.github.targets {
+            match (&target.org, &target.repo) {
+                (Some(_), Some(_)) => bail!("GitHub target cannot set both org and repo"),
+                (None, None) => bail!("GitHub target must set either org or repo"),
+                (Some(org), None) => validate_org_entry(org, "target org")?,
+                (None, Some(repo)) => validate_repo_entry(repo, "target repo")?,
             }
-            // Validate: either "org" or "org/repo"
-            let parts: Vec<&str> = entry.split('/').collect();
-            if parts.len() > 2 {
-                bail!(
-                    "Invalid watch entry '{}': expected 'org' or 'org/repo'",
-                    entry
-                );
+
+            for team in &target.team_review_requests {
+                validate_repo_entry(team, "team review request")?;
             }
-            for part in &parts {
-                if part.is_empty() {
-                    bail!("Invalid watch entry '{}': empty segment", entry);
-                }
+
+            if !target.direct_review_requests
+                && target.team_review_requests.is_empty()
+                && !target.include_authored
+                && !target.include_involved
+            {
+                bail!("GitHub target must enable at least one relationship");
             }
         }
         Ok(())
     }
+}
+
+fn validate_scope_entry(entry: &str, label: &str) -> Result<()> {
+    if entry.is_empty() {
+        bail!("GitHub {} cannot be empty", label);
+    }
+    let parts: Vec<&str> = entry.split('/').collect();
+    if parts.len() > 2 {
+        bail!(
+            "Invalid GitHub {} '{}': expected 'org' or 'org/repo'",
+            label,
+            entry
+        );
+    }
+    for part in &parts {
+        if part.is_empty() {
+            bail!("Invalid GitHub {} '{}': empty segment", label, entry);
+        }
+    }
+    Ok(())
+}
+
+fn validate_org_entry(entry: &str, label: &str) -> Result<()> {
+    if entry.is_empty() || entry.contains('/') {
+        bail!("Invalid GitHub {} '{}': expected 'org'", label, entry);
+    }
+    Ok(())
+}
+
+fn validate_repo_entry(entry: &str, label: &str) -> Result<()> {
+    if entry.is_empty() {
+        bail!("GitHub {} cannot be empty", label);
+    }
+    let parts: Vec<&str> = entry.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|p| p.is_empty()) {
+        bail!("Invalid GitHub {} '{}': expected 'org/repo'", label, entry);
+    }
+    Ok(())
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -243,6 +316,14 @@ pub fn example_config() -> &'static str {
 # Repositories to watch. Empty = all PRs involving you.
 # Entries can be org names ("myorg") or org/repo pairs ("myorg/important-repo").
 watch = []
+# For more precise targeting, use [[github.targets]]. Empty watch plus targets
+# means only these targets are searched.
+# [[github.targets]]
+# repo = "myorg/important-repo"
+# direct_review_requests = true          # user-review-requested:@me
+# team_review_requests = ["myorg/team"]  # team-review-requested:myorg/team
+# include_authored = true
+# include_involved = false
 # Poll interval in seconds
 poll_interval = 300
 
@@ -275,8 +356,6 @@ max_output_tokens = 4096
 diff_style = "unified"
 # Show line numbers in diff view
 show_line_numbers = true
-# Emit OSC 8 terminal hyperlinks for PR/file titles
-osc8_links = true
 "#
 }
 
@@ -293,7 +372,6 @@ mod tests {
         assert_eq!(config.llm.max_output_tokens, 4096);
         assert_eq!(config.tui.diff_style, "unified");
         assert!(config.tui.show_line_numbers);
-        assert!(config.tui.osc8_links);
     }
 
     #[test]
@@ -306,7 +384,6 @@ mod tests {
         // Empty endpoint resolves to the LM Studio default on load.
         assert_eq!(config.llm.endpoint, "");
         assert!(config.github.watch.is_empty());
-        assert!(config.tui.osc8_links);
     }
 
     #[test]
@@ -376,6 +453,40 @@ model = ""
         assert!(config.validate().is_err());
 
         config.github.watch = vec!["myorg/".to_string()];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_github_targets() {
+        let mut config = Config::default();
+        config.github.targets = vec![GithubTarget {
+            repo: Some("myorg/repo".to_string()),
+            team_review_requests: vec!["myorg/agentic-engineering".to_string()],
+            ..Default::default()
+        }];
+        assert!(config.validate().is_ok());
+
+        config.github.targets = vec![GithubTarget {
+            org: Some("myorg".to_string()),
+            repo: Some("myorg/repo".to_string()),
+            ..Default::default()
+        }];
+        assert!(config.validate().is_err());
+
+        config.github.targets = vec![GithubTarget {
+            repo: Some("myorg/repo".to_string()),
+            team_review_requests: vec!["agentic-engineering".to_string()],
+            ..Default::default()
+        }];
+        assert!(config.validate().is_err());
+
+        config.github.targets = vec![GithubTarget {
+            repo: Some("myorg/repo".to_string()),
+            direct_review_requests: false,
+            include_authored: false,
+            include_involved: false,
+            ..Default::default()
+        }];
         assert!(config.validate().is_err());
     }
 }

@@ -1,8 +1,10 @@
 pub mod activity;
 pub mod chrome;
+pub mod config;
 pub mod diff;
 pub mod files;
 pub mod inbox;
+pub mod loading;
 pub mod markdown;
 pub mod overview;
 pub mod setup;

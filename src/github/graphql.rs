@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use serde_json::json;
 use tracing::{debug, warn};
 
 use super::client::GitHubClient;
@@ -15,28 +16,25 @@ pub async fn fetch_viewer_login(client: &GitHubClient) -> Result<String> {
     Ok(login)
 }
 
-/// Build a batched GraphQL query for multiple PRs.
-/// Uses aliases to fetch multiple PRs in one request.
-pub fn build_batch_query(prs: &[(String, String, u64)]) -> String {
-    let mut query = String::from("query {\n");
+const MAX_CONNECTION_PAGES: usize = 20;
 
-    for (i, (owner, repo, number)) in prs.iter().enumerate() {
-        let alias = format!("pr{}", i);
-        query.push_str(&format!(
-            "  {}: repository(owner:\"{}\", name:\"{}\") {{\n\
-             pullRequest(number:{}) {{\n",
-            alias, owner, repo, number
-        ));
-        query.push_str(PR_DETAIL_FRAGMENT);
-        query.push_str("\n  }\n");
-        query.push_str("  }\n");
-    }
-
-    query.push_str("}\n");
-    query
+/// Build the variable-driven PR detail query.
+pub fn build_pr_detail_query() -> &'static str {
+    PR_DETAIL_QUERY
 }
 
-const PR_DETAIL_FRAGMENT: &str = r#"    id
+const PR_DETAIL_QUERY: &str = r#"query(
+  $owner: String!,
+  $repo: String!,
+  $number: Int!,
+  $reviewRequestsAfter: String,
+  $reviewThreadsAfter: String,
+  $timelineAfter: String,
+  $filesAfter: String
+) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      id
     number
     title
     body
@@ -48,7 +46,11 @@ const PR_DETAIL_FRAGMENT: &str = r#"    id
     baseRefName
     mergeable
     reviewDecision
-    reviewRequests(first: 20) {
+    reviewRequests(first: 100, after: $reviewRequestsAfter) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       nodes {
         requestedReviewer {
           ... on User { login }
@@ -86,11 +88,20 @@ const PR_DETAIL_FRAGMENT: &str = r#"    id
         }
       }
     }
-    reviewThreads(first: 20) {
+    reviewThreads(first: 100, after: $reviewThreadsAfter) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       nodes {
+        id
         isResolved
         isOutdated
-        comments(first: 5) {
+        comments(first: 100) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           nodes {
             author { login }
             body
@@ -100,7 +111,11 @@ const PR_DETAIL_FRAGMENT: &str = r#"    id
         }
       }
     }
-    timelineItems(first: 50) {
+    timelineItems(first: 100, after: $timelineAfter) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       nodes {
         __typename
         ... on IssueComment {
@@ -152,14 +167,40 @@ const PR_DETAIL_FRAGMENT: &str = r#"    id
         }
       }
     }
-    files(first: 100) {
+    files(first: 100, after: $filesAfter) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
       nodes {
         path
         additions
         deletions
         changeType
       }
-    }"#;
+    }
+    }
+  }
+}"#;
+
+const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          author { login }
+          body
+          path
+          line
+        }
+      }
+    }
+  }
+}"#;
 
 /// Parse a GraphQL response into PullRequest structs.
 /// Returns PRs keyed by their GraphQL node ID.
@@ -193,6 +234,23 @@ pub fn parse_batch_response(
     }
 
     results
+}
+
+fn parse_pr_response(
+    resp: &serde_json::Value,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Option<PullRequest> {
+    let pr_data = &resp["data"]["repository"]["pullRequest"];
+    if pr_data.is_null() {
+        debug!(
+            "PR {}/{}/{} not found in GraphQL response",
+            owner, repo, number
+        );
+        return None;
+    }
+    Some(parse_single_pr(pr_data, owner, repo))
 }
 
 fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullRequest {
@@ -560,8 +618,7 @@ fn parse_files(nodes: &serde_json::Value) -> Vec<PrFile> {
         .unwrap_or_default()
 }
 
-/// Fetch detail for a batch of search results.
-/// Groups into chunks to avoid GraphQL complexity limits.
+/// Fetch detail for search results.
 pub async fn fetch_pr_details(
     client: &GitHubClient,
     results: &[SearchResult],
@@ -573,21 +630,325 @@ pub async fn fetch_pr_details(
 
     let mut all_prs = Vec::new();
 
-    // Batch in groups of 10 to avoid complexity limits
-    for chunk in pr_keys.chunks(10) {
-        let query = build_batch_query(chunk);
-        let resp = client.graphql(&query).await?;
-        let prs = parse_batch_response(&resp, chunk);
-        all_prs.extend(prs);
+    for (owner, repo, number) in pr_keys {
+        if let Some(pr) = fetch_pr_detail(client, &owner, &repo, number).await? {
+            all_prs.push(pr);
+        }
     }
 
     Ok(all_prs)
+}
+
+async fn fetch_pr_detail(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Option<PullRequest>> {
+    let mut resp = client
+        .graphql_with_variables(
+            PR_DETAIL_QUERY,
+            pr_detail_variables(owner, repo, number, None, None, None, None),
+        )
+        .await?;
+
+    if pr_value(&resp).is_none() {
+        return Ok(None);
+    }
+
+    paginate_pr_connection(client, &mut resp, owner, repo, number, "reviewRequests").await?;
+    paginate_pr_connection(client, &mut resp, owner, repo, number, "reviewThreads").await?;
+    paginate_pr_connection(client, &mut resp, owner, repo, number, "timelineItems").await?;
+    paginate_pr_connection(client, &mut resp, owner, repo, number, "files").await?;
+    paginate_review_thread_comments(client, &mut resp).await?;
+
+    Ok(parse_pr_response(&resp, owner, repo, number))
+}
+
+fn pr_detail_variables(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    review_requests_after: Option<String>,
+    review_threads_after: Option<String>,
+    timeline_after: Option<String>,
+    files_after: Option<String>,
+) -> serde_json::Value {
+    json!({
+        "owner": owner,
+        "repo": repo,
+        "number": number,
+        "reviewRequestsAfter": review_requests_after,
+        "reviewThreadsAfter": review_threads_after,
+        "timelineAfter": timeline_after,
+        "filesAfter": files_after,
+    })
+}
+
+async fn paginate_pr_connection(
+    client: &GitHubClient,
+    merged: &mut serde_json::Value,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    connection: &str,
+) -> Result<()> {
+    let mut pages = 1usize;
+    while let Some(cursor) = next_cursor(pr_connection(merged, connection)) {
+        if pages >= MAX_CONNECTION_PAGES {
+            return Err(anyhow!(
+                "GraphQL {} pagination exceeded {} pages for {}/{}/{}",
+                connection,
+                MAX_CONNECTION_PAGES,
+                owner,
+                repo,
+                number
+            ));
+        }
+
+        let vars = match connection {
+            "reviewRequests" => {
+                pr_detail_variables(owner, repo, number, Some(cursor), None, None, None)
+            }
+            "reviewThreads" => {
+                pr_detail_variables(owner, repo, number, None, Some(cursor), None, None)
+            }
+            "timelineItems" => {
+                pr_detail_variables(owner, repo, number, None, None, Some(cursor), None)
+            }
+            "files" => pr_detail_variables(owner, repo, number, None, None, None, Some(cursor)),
+            _ => return Err(anyhow!("unknown PR connection '{}'", connection)),
+        };
+        let page = client.graphql_with_variables(PR_DETAIL_QUERY, vars).await?;
+        append_connection_page(merged, &page, connection)?;
+        pages += 1;
+    }
+    Ok(())
+}
+
+async fn paginate_review_thread_comments(
+    client: &GitHubClient,
+    merged: &mut serde_json::Value,
+) -> Result<()> {
+    let Some(nodes) = pr_connection_mut(merged, "reviewThreads")
+        .and_then(|v| v.get_mut("nodes"))
+        .and_then(|v| v.as_array_mut())
+    else {
+        return Ok(());
+    };
+
+    for thread in nodes {
+        let Some(thread_id) = thread.get("id").and_then(|v| v.as_str()).map(String::from) else {
+            continue;
+        };
+        let mut pages = 1usize;
+        while let Some(cursor) = next_cursor(thread.get("comments")) {
+            if pages >= MAX_CONNECTION_PAGES {
+                return Err(anyhow!(
+                    "GraphQL review thread comments pagination exceeded {} pages for thread {}",
+                    MAX_CONNECTION_PAGES,
+                    thread_id
+                ));
+            }
+            let page = client
+                .graphql_with_variables(
+                    REVIEW_THREAD_COMMENTS_QUERY,
+                    json!({ "threadId": thread_id, "after": cursor }),
+                )
+                .await?;
+            append_thread_comments_page(thread, &page)?;
+            pages += 1;
+        }
+    }
+
+    Ok(())
+}
+
+fn pr_value(resp: &serde_json::Value) -> Option<&serde_json::Value> {
+    let pr = &resp["data"]["repository"]["pullRequest"];
+    if pr.is_null() {
+        None
+    } else {
+        Some(pr)
+    }
+}
+
+fn pr_value_mut(resp: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    let pr = &mut resp["data"]["repository"]["pullRequest"];
+    if pr.is_null() {
+        None
+    } else {
+        Some(pr)
+    }
+}
+
+fn pr_connection<'a>(resp: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    pr_value(resp).and_then(|pr| pr.get(name))
+}
+
+fn pr_connection_mut<'a>(
+    resp: &'a mut serde_json::Value,
+    name: &str,
+) -> Option<&'a mut serde_json::Value> {
+    pr_value_mut(resp).and_then(|pr| pr.get_mut(name))
+}
+
+fn next_cursor(connection: Option<&serde_json::Value>) -> Option<String> {
+    let page_info = connection?.get("pageInfo")?;
+    if !page_info
+        .get("hasNextPage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    page_info
+        .get("endCursor")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+fn append_connection_page(
+    merged: &mut serde_json::Value,
+    page: &serde_json::Value,
+    connection: &str,
+) -> Result<()> {
+    let page_connection = pr_connection(page, connection)
+        .ok_or_else(|| anyhow!("GraphQL page missing {} connection", connection))?;
+    let page_nodes = page_connection
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let page_info = page_connection
+        .get("pageInfo")
+        .cloned()
+        .unwrap_or_else(|| json!({ "hasNextPage": false, "endCursor": null }));
+
+    let merged_connection = pr_connection_mut(merged, connection)
+        .ok_or_else(|| anyhow!("GraphQL base response missing {} connection", connection))?;
+    let merged_nodes = merged_connection
+        .get_mut("nodes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("GraphQL {} connection missing nodes", connection))?;
+    merged_nodes.extend(page_nodes);
+    merged_connection["pageInfo"] = page_info;
+    Ok(())
+}
+
+fn append_thread_comments_page(
+    thread: &mut serde_json::Value,
+    page: &serde_json::Value,
+) -> Result<()> {
+    let page_comments = page
+        .get("data")
+        .and_then(|v| v.get("node"))
+        .and_then(|v| v.get("comments"))
+        .ok_or_else(|| anyhow!("GraphQL page missing review thread comments"))?;
+    let page_nodes = page_comments
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let page_info = page_comments
+        .get("pageInfo")
+        .cloned()
+        .unwrap_or_else(|| json!({ "hasNextPage": false, "endCursor": null }));
+
+    let comments = thread
+        .get_mut("comments")
+        .ok_or_else(|| anyhow!("review thread missing comments connection"))?;
+    let merged_nodes = comments
+        .get_mut("nodes")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow!("review thread comments missing nodes"))?;
+    merged_nodes.extend(page_nodes);
+    comments["pageInfo"] = page_info;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_pr_detail_query_uses_variables_not_string_interpolation() {
+        let query = build_pr_detail_query();
+        assert!(query.contains("$owner: String!"));
+        assert!(query.contains("repository(owner: $owner, name: $repo)"));
+        assert!(!query.contains("repository(owner:\""));
+    }
+
+    #[test]
+    fn test_append_connection_page_merges_nodes_and_page_info() {
+        let mut merged = json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "files": {
+                            "pageInfo": { "hasNextPage": true, "endCursor": "a" },
+                            "nodes": [{ "path": "a.txt" }]
+                        }
+                    }
+                }
+            }
+        });
+        let page = json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "files": {
+                            "pageInfo": { "hasNextPage": false, "endCursor": null },
+                            "nodes": [{ "path": "b.txt" }]
+                        }
+                    }
+                }
+            }
+        });
+
+        append_connection_page(&mut merged, &page, "files").unwrap();
+
+        let files = merged["data"]["repository"]["pullRequest"]["files"]["nodes"]
+            .as_array()
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], "a.txt");
+        assert_eq!(files[1]["path"], "b.txt");
+        assert_eq!(
+            merged["data"]["repository"]["pullRequest"]["files"]["pageInfo"]["hasNextPage"],
+            false
+        );
+    }
+
+    #[test]
+    fn test_append_thread_comments_page_merges_comments() {
+        let mut thread = json!({
+            "id": "thread1",
+            "comments": {
+                "pageInfo": { "hasNextPage": true, "endCursor": "a" },
+                "nodes": [{ "body": "first" }]
+            }
+        });
+        let page = json!({
+            "data": {
+                "node": {
+                    "comments": {
+                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                        "nodes": [{ "body": "second" }]
+                    }
+                }
+            }
+        });
+
+        append_thread_comments_page(&mut thread, &page).unwrap();
+
+        let comments = thread["comments"]["nodes"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["body"], "first");
+        assert_eq!(comments[1]["body"], "second");
+        assert_eq!(thread["comments"]["pageInfo"]["hasNextPage"], false);
+    }
 
     #[test]
     fn test_parse_single_pr_minimal() {

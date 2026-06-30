@@ -70,8 +70,16 @@ Config lives at `~/.config/brunson/config.toml` (or `$XDG_CONFIG_HOME/brunson/co
 
 ```toml
 [github]
-watch = ["myorg", "myorg/important-repo"]  # empty = all PRs involving you
-poll_interval = 300                          # seconds
+watch = []          # shorthand: empty = all PRs involving you
+poll_interval = 300 # seconds
+
+# Precise targeting. With watch = [], only these targets are searched.
+[[github.targets]]
+repo = "myorg/important-repo"
+direct_review_requests = true          # direct requests for @me only
+team_review_requests = ["myorg/team"]  # only these team review requests
+include_authored = true
+include_involved = false
 
 [daemon]
 port = 17890              # local HTTP API port
@@ -89,10 +97,10 @@ max_output_tokens = 4096  # increase for reasoning-heavy local models
 [tui]
 diff_style = "unified"       # or "side-by-side"
 show_line_numbers = true
-osc8_links = true            # emit OSC 8 terminal hyperlinks for PR/file titles
 ```
 
-Set `osc8_links = false` if your terminal emulator misrenders OSC 8 hyperlinks or you prefer plain text. The `o` key always opens the selected PR in a browser regardless of this setting.
+The `o` key opens the selected PR in a browser.
+
 
 ### GitHub Enterprise
 
@@ -165,6 +173,22 @@ Machine-readable setup diagnostics. Returns `ready`, `status` (`missing_config`,
 
 ```bash
 curl http://localhost:17890/setup/status
+```
+
+### `GET /config/preview`
+
+Show the GitHub search queries generated from the current effective config.
+
+```bash
+curl http://localhost:17890/config/preview
+```
+
+### `POST /config/validate`
+
+Validate a proposed config JSON payload and preview the generated GitHub search queries.
+
+```bash
+curl -X POST http://localhost:17890/config/validate
 ```
 
 ### `POST /config/reload`

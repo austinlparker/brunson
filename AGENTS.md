@@ -86,6 +86,8 @@ curl -s http://localhost:17890/health | jq .refresh_in_progress
 | POST | `/prs/refresh` | Trigger immediate GitHub poll (returns 202) |
 | POST | `/prs/{id}/classify` | Re-run LLM classification (returns 202 or 503) |
 | GET | `/config` | Effective config, redacted (no secrets) |
+| GET | `/config/preview` | Generated GitHub search queries for the current config |
+| POST | `/config/validate` | Validate a proposed config and preview generated queries |
 
 ## Agent-Driven Setup Workflow
 
@@ -98,8 +100,15 @@ brunson setup --yes
 # 2. Write the TOML config (stable schema) programmatically, for example:
 cat > ~/.config/brunson/config.toml <<'EOF'
 [github]
-watch = ["myorg", "myorg/important-repo"]
+watch = []
 poll_interval = 300
+
+[[github.targets]]
+repo = "myorg/important-repo"
+direct_review_requests = true
+team_review_requests = ["myorg/team"]
+include_authored = true
+include_involved = false
 
 [daemon]
 port = 17890
@@ -136,7 +145,7 @@ done
 | 4 | Files | green | Changed-file picker with status, additions, deletions |
 | 5 | Diff | teal | Unified diff with two-number gutter and inline review comments |
 
-Navigation: `←/h` back, `→/l/Enter` deeper, `1`–`5` jump, `j/k`/`↑↓` scroll, `R` refresh, `q` quit.
+Navigation: `←/h` back, `→/l/Enter` deeper, `1`–`5` jump, `j/k`/`↑↓` scroll, `c` config preview, `R` refresh, `q` quit.
 
 The status line at the bottom shows the selected PR title, current blade, and a block cursor; the keybar below it lists bindings. Press `o` to open the selected PR in a browser. (PR titles and file paths are intentionally not rendered as OSC 8 hyperlinks — doing so via `Cell::set_symbol` corrupts ratatui 0.30's cell-width calculation and breaks the selection highlight.)
 

@@ -68,6 +68,20 @@ pub struct ConfigReloadResponse {
     pub error: Option<String>,
 }
 
+/// GET /config/preview and POST /config/validate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPreviewResponse {
+    pub queries: Vec<String>,
+}
+
+/// POST /config/validate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigValidateResponse {
+    pub valid: bool,
+    pub error: Option<String>,
+    pub preview: ConfigPreviewResponse,
+}
+
 /// GET /prs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrListResponse {

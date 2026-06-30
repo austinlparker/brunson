@@ -169,22 +169,10 @@ impl Blade {
 }
 
 /// Semantic theme used by all new components.
-#[derive(Debug, Clone, Copy)]
-pub struct Theme {
-    pub osc8_enabled: bool,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self { osc8_enabled: true }
-    }
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Theme;
 
 impl Theme {
-    pub const fn new(osc8_enabled: bool) -> Self {
-        Self { osc8_enabled }
-    }
-
     pub fn base_bg(&self) -> Style {
         Style::default().bg(BASE)
     }

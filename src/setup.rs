@@ -236,6 +236,7 @@ pub async fn run_setup(args: &SetupArgs) -> Result<()> {
     let config = Config {
         github: GithubConfig {
             watch,
+            targets: Vec::new(),
             poll_interval: 300,
         },
         daemon: DaemonConfig::default(),

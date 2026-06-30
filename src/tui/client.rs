@@ -104,6 +104,10 @@ impl DaemonClient {
         self.get("/setup/status").await
     }
 
+    pub async fn get_config(&self) -> Result<crate::config::Config> {
+        self.get("/config").await
+    }
+
     pub async fn reload_config(&self) -> Result<()> {
         let url = format!("{}/config/reload", self.base_url);
         let resp = self.client.post(&url).send().await?;

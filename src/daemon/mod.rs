@@ -11,20 +11,30 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{Config, LlmConfig};
 use crate::daemon::poller::PollState;
 use crate::daemon::server::AppState;
-use crate::daemon::setup_status::{evaluate_setup, SetupAuthImpl, SetupCache};
+use crate::daemon::setup_status::{evaluate_setup, SetupAuth, SetupAuthImpl, SetupCache};
 use crate::daemon::store::{PrStore, SharedStore};
-use crate::github::auth::{resolve_host, resolve_token};
+use crate::github::auth::resolve_host;
 use crate::github::client::GitHubClient;
-use crate::github::graphql::fetch_viewer_login;
 use crate::llm::classifier::Classifier;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Resolve the current GitHub client and verified viewer login as one invariant.
+pub async fn resolve_github_client_and_user(
+    auth: &dyn SetupAuth,
+) -> Result<(GitHubClient, String)> {
+    let token = auth.resolve_token()?;
+    let host = resolve_host();
+    let client = GitHubClient::new(token.clone(), Some(host.clone()))?;
+    let login = auth.viewer_login(&token, &host).await?;
+    Ok((client, login))
+}
 
 /// Build a classifier from the latest LLM configuration.
 pub async fn build_classifier(config: &LlmConfig) -> Option<Arc<Classifier>> {
@@ -68,39 +78,18 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
     // Write PID file
     write_pid_file()?;
 
+    let setup_auth = SetupAuthImpl;
     // Resolve auth. Do not fail startup if auth is missing; `/setup/status` will
     // report the problem and the daemon can recover via `POST /config/reload`.
-    let gh_client: Option<GitHubClient> = match resolve_token() {
-        Ok(token) => match GitHubClient::new(token, Some(resolve_host())) {
-            Ok(client) => Some(client),
-            Err(e) => {
-                warn!("Failed to build GitHub client: {}", e);
-                None
-            }
-        },
+    let (gh_client, current_user) = match resolve_github_client_and_user(&setup_auth).await {
+        Ok((client, login)) => {
+            info!("Authenticated as: {}", login);
+            (Some(client), login)
+        }
         Err(e) => {
-            warn!("GitHub auth not resolved at startup: {}", e);
-            None
+            warn!("GitHub auth/client not resolved at startup: {}", e);
+            (None, "unknown".to_string())
         }
-    };
-
-    // Resolve current user
-    let current_user = if let Some(ref client) = gh_client {
-        match fetch_viewer_login(client).await {
-            Ok(login) => {
-                info!("Authenticated as: {}", login);
-                login
-            }
-            Err(e) => {
-                error!(
-                    "Failed to fetch viewer login: {}. Starting with empty user.",
-                    e
-                );
-                "unknown".to_string()
-            }
-        }
-    } else {
-        "unknown".to_string()
     };
 
     // Create shared store

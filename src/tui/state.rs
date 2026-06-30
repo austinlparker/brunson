@@ -317,20 +317,41 @@ impl ViewStateManager {
             .diff_scroll
             .set_content_viewport(app.render_cache.diff_lines.len(), diff_viewport);
 
-        let overview_viewport = layout.blade(Blade::Overview).content.height as usize;
-        self.view
-            .overview_summary_scroll
-            .set_content_viewport(app.render_cache.overview_summary.len(), overview_viewport);
-        self.view.overview_description_scroll.set_content_viewport(
+        // Clamp each Overview section against the height it is actually rendered
+        // into, not the full body. `render_body_rows` splits the body via
+        // `overview_section_heights`; mirror that here so scrolling can reach
+        // content that overflows a section's slice.
+        let lens = [
+            app.render_cache.overview_summary.len(),
             app.render_cache.overview_description.len(),
-            overview_viewport,
+            app.render_cache.overview_checks.len(),
+        ];
+        let overview_body = layout
+            .blade(Blade::Overview)
+            .content
+            .height
+            .saturating_sub(crate::tui::views::overview::OVERVIEW_CHROME_ROWS);
+        let section_heights = crate::tui::views::overview::overview_section_heights(
+            overview_body,
+            lens,
+            self.view.overview_focus,
+        );
+        // Each scrollable section reserves one row for its header label.
+        self.view.overview_summary_scroll.set_content_viewport(
+            lens[0],
+            section_heights[0].saturating_sub(1) as usize,
+        );
+        self.view.overview_description_scroll.set_content_viewport(
+            lens[1],
+            section_heights[1].saturating_sub(1) as usize,
+        );
+        self.view.overview_checks_scroll.set_content_viewport(
+            lens[2],
+            section_heights[2].saturating_sub(1) as usize,
         );
         self.view
-            .overview_checks_scroll
-            .set_content_viewport(app.render_cache.overview_checks.len(), overview_viewport);
-        self.view
             .overview_last_activity_scroll
-            .set_content_viewport(1, overview_viewport);
+            .set_content_viewport(1, section_heights[3] as usize);
 
         // 5. Keep selected items visible.
         // The Inbox scroll offset is measured in screen lines that include

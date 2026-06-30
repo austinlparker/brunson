@@ -174,6 +174,7 @@ pub fn render_keybar(f: &mut Frame, area: Rect, ctx: &RenderContext) {
         ("⏎", "drill"),
         ("a/r/m", "act"),
         ("o", "open"),
+        ("c", "config"),
         ("R", "refresh"),
         ("/", "search"),
         ("?", "help"),

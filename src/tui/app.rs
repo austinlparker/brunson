@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
@@ -16,7 +16,7 @@ use tracing::info;
 use crate::api::*;
 use crate::config::Config;
 use crate::tui::client::DaemonClient;
-use crate::tui::event::{spawn_event_loop, TuiEvent};
+use crate::tui::event::{spawn_event_loop, StartupLoad, TuiEvent};
 use crate::tui::render::cache::RenderCache;
 use crate::tui::render::chrome::InlineToast;
 use crate::tui::render::component::{Component, RenderContext};
@@ -32,6 +32,16 @@ pub enum Action {
     Refresh,
     RunSetup,
     ReloadConfig,
+    ToggleConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupPhase {
+    StartingDaemon,
+    CheckingSetup,
+    LoadingConfig,
+    LoadingPrs,
+    Ready,
 }
 
 /// Central TUI application state. This struct holds domain and cache data only —
@@ -47,6 +57,10 @@ pub struct AppState {
     pub setup_status: Option<crate::api::SetupStatusResponse>,
     /// When true, the setup wizard overlay replaces the dashboard.
     pub show_setup_wizard: bool,
+    /// When true, show the configuration inspector overlay.
+    pub show_config_view: bool,
+    /// Scroll offset for the configuration inspector overlay.
+    pub config_scroll: usize,
 
     /// Currently selected PR slug.
     pub selected_pr_id: Option<String>,
@@ -66,6 +80,10 @@ pub struct AppState {
     pub daemon_child: Option<Child>,
     /// Loading state.
     pub loading: bool,
+    /// Initial loading phase displayed while the TUI is bootstrapping.
+    pub startup_phase: StartupPhase,
+    /// Monotonic UI animation tick.
+    pub ui_tick: u64,
     /// Tracks whether selected PR changed and detail needs reload.
     pub detail_needs_reload: bool,
     /// Tracks whether the diff needs reload.
@@ -92,6 +110,8 @@ impl AppState {
             health: None,
             setup_status: None,
             show_setup_wizard: false,
+            show_config_view: false,
+            config_scroll: 0,
             selected_pr_id: None,
             pr_detail: None,
             pr_diff: None,
@@ -101,11 +121,37 @@ impl AppState {
             error_message: None,
             daemon_child: None,
             loading: false,
+            startup_phase: StartupPhase::StartingDaemon,
+            ui_tick: 0,
             detail_needs_reload: false,
             diff_needs_reload: false,
             detail_loading: false,
             diff_loading: false,
             render_cache: RenderCache::new(),
+        }
+    }
+
+    /// Fetch effective daemon config and keep the local TUI copy in sync.
+    pub async fn fetch_config(&mut self) {
+        match self.client.get_config().await {
+            Ok(config) => {
+                self.config = config;
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to fetch config: {}", e));
+            }
+        }
+    }
+
+    /// Fetch daemon health without refreshing PR data.
+    pub async fn fetch_health(&mut self) {
+        match self.client.get_health().await {
+            Ok(health) => {
+                self.health = Some(health);
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to fetch health: {}", e));
+            }
         }
     }
 
@@ -139,6 +185,63 @@ impl AppState {
         self.pr_diff = None;
         self.diff_lines = Vec::new();
         self.diff_comments = HashMap::new();
+    }
+
+    fn selected_summary(&self) -> Option<PrSummary> {
+        let id = self.selected_pr_id.as_ref()?;
+        self.prs
+            .groups
+            .values()
+            .flat_map(|prs| prs.iter())
+            .find(|pr| &pr.id == id)
+            .cloned()
+    }
+
+    fn mark_selected_detail_stale(&mut self) {
+        self.detail_needs_reload = true;
+        self.diff_needs_reload = true;
+        self.pr_detail = None;
+        self.clear_diff_cache();
+        self.render_cache.clear();
+    }
+
+    fn reconcile_selected_detail_freshness(&mut self) {
+        let Some(id) = self.selected_pr_id.clone() else {
+            return;
+        };
+        let Some(summary) = self.selected_summary() else {
+            self.selected_pr_id = None;
+            self.mark_selected_detail_stale();
+            return;
+        };
+
+        let detail_is_stale = self.pr_detail.as_ref().is_none_or(|detail| {
+            detail.id != id
+                || detail.id != summary.id
+                || detail.updated_at != summary.updated_at
+                || detail.llm_priority != summary.llm_priority
+        });
+        if detail_is_stale {
+            self.mark_selected_detail_stale();
+        }
+    }
+
+    fn accept_detail(&mut self, detail: PrDetailResponse) {
+        self.pr_detail = Some(detail);
+        self.render_cache.clear();
+    }
+
+    fn accept_diff(&mut self, diff_resp: DiffResponse) {
+        self.diff_lines = crate::diff::render::parse_diff(&diff_resp.diff);
+        self.pr_diff = Some(diff_resp);
+        self.render_cache.clear();
+
+        if let Some(detail) = &self.pr_detail {
+            self.diff_comments = crate::diff::render::map_review_threads_to_diff_indices(
+                &detail.review_threads,
+                &self.diff_lines,
+            );
+        }
     }
 
     /// Move selection up/down within the Inbox blade.
@@ -284,8 +387,13 @@ impl AppState {
             return self.handle_setup_key(key);
         }
 
+        if self.show_config_view {
+            return self.handle_config_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => return Action::Quit,
+            KeyCode::Char('c') | KeyCode::Char('C') => return Action::ToggleConfig,
             KeyCode::Char('R') => {
                 self.loading = true;
                 self.error_message = None;
@@ -305,7 +413,7 @@ impl AppState {
             }
             KeyCode::Char('?') => {
                 self.error_message = Some(
-                    "Help: 1-5 jump blades, ←/→ or h/l/⏎ navigate, j/k ↑↓ scroll, Tab cycle overview sections, R refresh, q quit".to_string(),
+                    "Help: 1-5 jump blades, ←/→ or h/l/⏎ navigate, j/k ↑↓ scroll, Tab cycle overview sections, c config, R refresh, q quit".to_string(),
                 );
             }
             KeyCode::Char('n') if view.view.active_blade == Blade::Diff => {
@@ -365,6 +473,23 @@ impl AppState {
             KeyCode::Char('?') => {
                 self.error_message =
                     Some("Setup overlay keys: s run setup, R reload config, q quit".to_string());
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn handle_config_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => Action::ToggleConfig,
+            KeyCode::Char('R') => Action::ReloadConfig,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.config_scroll = self.config_scroll.saturating_add(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.config_scroll = self.config_scroll.saturating_sub(1);
                 Action::None
             }
             _ => Action::None,
@@ -438,19 +563,7 @@ impl AppState {
             Ok(resp) => {
                 self.prs = resp;
                 self.loading = false;
-                let all_ids: HashSet<&String> = self
-                    .prs
-                    .groups
-                    .values()
-                    .flat_map(|prs| prs.iter().map(|p| &p.id))
-                    .collect();
-                if let Some(ref id) = self.selected_pr_id {
-                    if !all_ids.contains(id) {
-                        self.selected_pr_id = None;
-                        self.detail_needs_reload = true;
-                        self.diff_needs_reload = true;
-                    }
-                }
+                self.reconcile_selected_detail_freshness();
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to fetch PRs: {}", e));
@@ -474,11 +587,12 @@ impl AppState {
     pub async fn load_detail(&mut self) {
         if let Some(id) = &self.selected_pr_id {
             match self.client.get_pr_detail(id).await {
-                Ok(detail) => self.pr_detail = Some(detail),
+                Ok(detail) => self.accept_detail(detail),
                 Err(e) => self.error_message = Some(format!("Failed to load detail: {}", e)),
             }
         } else {
             self.pr_detail = None;
+            self.render_cache.clear();
         }
         self.detail_needs_reload = false;
     }
@@ -488,17 +602,7 @@ impl AppState {
         if let Some(id) = &self.selected_pr_id {
             match self.client.get_pr_diff(id).await {
                 Ok(diff_resp) => {
-                    self.diff_lines = crate::diff::render::parse_diff(&diff_resp.diff);
-                    self.pr_diff = Some(diff_resp);
-
-                    if let Some(detail) = &self.pr_detail {
-                        self.diff_comments =
-                            crate::diff::render::map_review_threads_to_diff_indices(
-                                &detail.review_threads,
-                                &self.diff_lines,
-                            );
-                    }
-
+                    self.accept_diff(diff_resp);
                     // Make sure the selected file boundary is visible. The actual scroll
                     // clamping and viewport sizing happens in ViewStateManager::prepare.
                 }
@@ -519,16 +623,9 @@ pub async fn run_tui_with_config_path(config: Config, config_path: Option<PathBu
     let port = config.daemon.port;
 
     let client = DaemonClient::new(port)?;
-    let daemon_child = ensure_daemon(&client, port, config_path.as_deref()).await?;
 
     let mut state = AppState::new(config, client);
-    state.daemon_child = daemon_child;
     state.config_path = config_path.clone();
-
-    state.fetch_setup_status().await;
-    if !state.show_setup_wizard {
-        state.refresh_data().await;
-    }
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -647,7 +744,7 @@ pub fn render_frame(f: &mut ratatui::Frame, state: &mut AppState, view: &mut Vie
     // Reconcile view state with domain/cached data and clamp scroll offsets.
     view.prepare(state, &layout);
 
-    let theme = Theme::new(state.config.tui.osc8_links);
+    let theme = Theme;
     let ctx = RenderContext::new(state, &view.view, &theme);
 
     // Chrome.
@@ -664,6 +761,14 @@ pub fn render_frame(f: &mut ratatui::Frame, state: &mut AppState, view: &mut Vie
         Blade::Diff => crate::tui::views::diff::render_diff(f, active_area, &ctx),
     }
 
+    if state.show_config_view {
+        crate::tui::views::config::render_config_view(f, layout.body, &ctx);
+    }
+
+    if state.startup_phase != StartupPhase::Ready {
+        crate::tui::views::loading::render_loading(f, layout.body, &ctx);
+    }
+
     // Error/action-stub feedback renders as a centered overlay over the body.
     // The keybar remains visible with its bindings at all times.
     InlineToast.render(f, layout.body, &ctx);
@@ -676,8 +781,54 @@ async fn run_render_loop(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_handle = spawn_event_loop(event_tx.clone());
     let mut view = ViewStateManager::new();
+    let mut startup_spawned = false;
 
     loop {
+        if !startup_spawned {
+            let tx = event_tx.clone();
+            let client = state.client.clone();
+            let port = state.config.daemon.port;
+            let config_path = state.config_path.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let daemon_child = ensure_daemon(&client, port, config_path.as_deref())
+                        .await
+                        .map_err(|e| format!("Failed to start daemon: {}", e))?;
+                    let setup_status = client
+                        .get_setup_status()
+                        .await
+                        .map_err(|e| format!("Failed to fetch setup status: {}", e))?;
+                    let config = client
+                        .get_config()
+                        .await
+                        .map_err(|e| format!("Failed to fetch config: {}", e))?;
+                    let prs = if setup_status.ready {
+                        client
+                            .get_prs()
+                            .await
+                            .map_err(|e| format!("Failed to fetch PRs: {}", e))?
+                    } else {
+                        PrListResponse {
+                            groups: HashMap::new(),
+                            updated_at: String::new(),
+                        }
+                    };
+                    let health = client.get_health().await.ok();
+                    Ok(StartupLoad {
+                        daemon_child,
+                        setup_status,
+                        config,
+                        prs,
+                        health,
+                    })
+                }
+                .await;
+                let _ = tx.send(TuiEvent::StartupLoaded(Box::new(result)));
+            });
+            startup_spawned = true;
+            state.startup_phase = StartupPhase::CheckingSetup;
+        }
+
         // Start async detail/diff fetches instead of blocking the render loop.
         if state.detail_needs_reload {
             if let Some(id) = state.selected_pr_id.clone() {
@@ -724,6 +875,8 @@ async fn run_render_loop(
                     }
                     Action::ReloadConfig => match state.client.reload_config().await {
                         Ok(()) => {
+                            state.fetch_config().await;
+                            state.fetch_health().await;
                             state.fetch_setup_status().await;
                             if !state.show_setup_wizard {
                                 state.refresh_data().await;
@@ -733,6 +886,17 @@ async fn run_render_loop(
                             state.error_message = Some(format!("Failed to reload config: {}", e));
                         }
                     },
+                    Action::ToggleConfig => {
+                        if state.show_config_view {
+                            state.show_config_view = false;
+                        } else {
+                            state.fetch_config().await;
+                            state.fetch_health().await;
+                            state.fetch_setup_status().await;
+                            state.config_scroll = 0;
+                            state.show_config_view = true;
+                        }
+                    }
                     Action::RunSetup => {
                         // Suspend the terminal so the interactive brunson setup
                         // subprocess can take over stdin/stdout.
@@ -785,16 +949,41 @@ async fn run_render_loop(
             }
             TuiEvent::Resize(_, _) => {}
             TuiEvent::DataTick => {
-                if !state.show_setup_wizard {
+                if !state.show_setup_wizard && state.startup_phase == StartupPhase::Ready {
                     state.refresh_data().await;
                 }
             }
-            TuiEvent::UiTick => {}
+            TuiEvent::UiTick => {
+                state.ui_tick = state.ui_tick.wrapping_add(1);
+                state.startup_phase = match (state.startup_phase, state.ui_tick % 4) {
+                    (StartupPhase::Ready, _) => StartupPhase::Ready,
+                    (_, 0) => StartupPhase::CheckingSetup,
+                    (_, 1) => StartupPhase::LoadingConfig,
+                    (_, _) => StartupPhase::LoadingPrs,
+                };
+            }
+            TuiEvent::StartupLoaded(result) => match *result {
+                Ok(load) => {
+                    state.daemon_child = load.daemon_child;
+                    state.show_setup_wizard = !load.setup_status.ready;
+                    state.setup_status = Some(load.setup_status);
+                    state.config = load.config;
+                    state.prs = load.prs;
+                    state.health = load.health;
+                    state.loading = false;
+                    state.reconcile_selected_detail_freshness();
+                    state.startup_phase = StartupPhase::Ready;
+                }
+                Err(e) => {
+                    state.error_message = Some(e);
+                    state.startup_phase = StartupPhase::Ready;
+                }
+            },
             TuiEvent::DetailLoaded(id, result) => {
                 state.detail_loading = false;
                 if state.selected_pr_id.as_ref() == Some(&id) {
                     match *result {
-                        Ok(detail) => state.pr_detail = Some(detail),
+                        Ok(detail) => state.accept_detail(detail),
                         Err(e) => {
                             state.error_message = Some(format!("Failed to load detail: {}", e))
                         }
@@ -806,15 +995,7 @@ async fn run_render_loop(
                 if state.selected_pr_id.as_ref() == Some(&id) {
                     match result {
                         Ok(diff_resp) => {
-                            state.diff_lines = crate::diff::render::parse_diff(&diff_resp.diff);
-                            state.pr_diff = Some(diff_resp);
-                            if let Some(detail) = &state.pr_detail {
-                                state.diff_comments =
-                                    crate::diff::render::map_review_threads_to_diff_indices(
-                                        &detail.review_threads,
-                                        &state.diff_lines,
-                                    );
-                            }
+                            state.accept_diff(diff_resp);
                             state.scroll_diff_to_selected_file(&mut view);
                         }
                         Err(e) => state.error_message = Some(format!("Failed to load diff: {}", e)),
@@ -873,6 +1054,89 @@ mod tests {
             url: "https://example.com".to_string(),
             comments: 0,
         }
+    }
+
+    fn make_detail(id: &str, updated_at: &str, priority: Option<Priority>) -> PrDetailResponse {
+        let parts: Vec<&str> = id.split('~').collect();
+        PrDetailResponse {
+            id: id.to_string(),
+            node_id: "node".to_string(),
+            owner: parts.first().unwrap_or(&"org").to_string(),
+            repo: parts.get(1).unwrap_or(&"repo").to_string(),
+            number: parts.get(2).and_then(|n| n.parse().ok()).unwrap_or(1),
+            title: "Test PR".to_string(),
+            body: String::new(),
+            url: "https://example.com".to_string(),
+            author: "other".to_string(),
+            is_draft: false,
+            updated_at: updated_at.to_string(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            mergeable: "MERGEABLE".to_string(),
+            review_decision: None,
+            review_requests: vec![],
+            viewer_latest_review: None,
+            latest_reviews: vec![],
+            check_status: "none".to_string(),
+            checks: vec![],
+            review_threads: vec![],
+            files: vec![],
+            timeline: vec![],
+            llm_priority: priority,
+            llm_summary: None,
+        }
+    }
+
+    #[test]
+    fn selected_detail_is_marked_stale_when_summary_updated_at_changes() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "review_needed".to_string(),
+            vec![make_summary("org~repo~1", "review_needed", "other", None)],
+        );
+        let mut state = make_test_state(groups);
+        state.selected_pr_id = Some("org~repo~1".to_string());
+        state.pr_detail = Some(make_detail("org~repo~1", "2023-01-01T00:00:00Z", None));
+        state.pr_diff = Some(DiffResponse {
+            diff: "diff --git a/a b/a\n".to_string(),
+            cached: true,
+        });
+        state
+            .render_cache
+            .overview_summary
+            .push(ratatui::text::Line::from("stale"));
+
+        state.reconcile_selected_detail_freshness();
+
+        assert!(state.detail_needs_reload);
+        assert!(state.diff_needs_reload);
+        assert!(state.pr_detail.is_none());
+        assert!(state.pr_diff.is_none());
+        assert!(state.render_cache.overview_summary.is_empty());
+    }
+
+    #[test]
+    fn accepting_detail_and_diff_clears_render_cache() {
+        let groups = HashMap::new();
+        let mut state = make_test_state(groups);
+        state
+            .render_cache
+            .overview_summary
+            .push(ratatui::text::Line::from("old"));
+        state.accept_detail(make_detail("org~repo~1", "2024-01-01T00:00:00Z", None));
+        assert!(state.render_cache.overview_summary.is_empty());
+
+        state
+            .render_cache
+            .diff_lines
+            .push(ratatui::text::Line::from("old diff"));
+        state.accept_diff(DiffResponse {
+            diff: "diff --git a/a.txt b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_string(),
+            cached: false,
+        });
+        assert!(state.render_cache.diff_lines.is_empty());
+        assert!(state.pr_diff.is_some());
+        assert!(!state.diff_lines.is_empty());
     }
 
     #[test]
@@ -1009,7 +1273,6 @@ mod tests {
         );
 
         let mut state = make_test_state(groups);
-        state.config.tui.osc8_links = true;
         state.selected_pr_id = Some("org~repo~1".to_string());
         state.pr_detail = Some(crate::api::PrDetailResponse {
             id: "org~repo~1".to_string(),
@@ -1145,7 +1408,6 @@ mod tests {
         );
 
         let mut state = make_test_state(groups);
-        state.config.tui.osc8_links = true;
         state.selected_pr_id = Some("org~repo~1".to_string());
 
         let backend = TestBackend::new(111, 30);
@@ -1228,7 +1490,6 @@ mod tests {
         );
 
         let mut state = make_test_state(groups);
-        state.config.tui.osc8_links = true;
         state.selected_pr_id = Some("org~repo~1".to_string());
         state.pr_detail = Some(crate::api::PrDetailResponse {
             id: "org~repo~1".to_string(),
@@ -1336,40 +1597,33 @@ mod tests {
         );
 
         // The selected row must carry the selection background across the full
-        // blade width. PR/file titles are deliberately not hyperlinked (those
-        // overlays corrupted cell widths and broke the highlight), so the OSC 8
-        // setting must not matter.
-        for osc8 in [false, true] {
-            let mut state = make_test_state(groups.clone());
-            state.config.tui.osc8_links = osc8;
-            let backend = TestBackend::new(120, 30);
-            let mut terminal = Terminal::new(backend).unwrap();
-            let mut view = ViewStateManager::new();
-            view.view.active_blade = Blade::Inbox;
-            terminal
-                .draw(|f| render_frame(f, &mut state, &mut view))
-                .unwrap();
+        // blade width. PR/file titles are deliberately not hyperlinked because
+        // those overlays corrupted cell widths and broke the highlight.
+        let mut state = make_test_state(groups.clone());
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Inbox;
+        terminal
+            .draw(|f| render_frame(f, &mut state, &mut view))
+            .unwrap();
 
-            let buf = terminal.backend().buffer();
-            let layout = crate::tui::render::layout::RootLayout::new(Blade::Inbox)
-                .compute(ratatui::layout::Rect::new(0, 0, 120, 28));
-            let content = layout.active_content();
-            let selected_y = find_selected_row(buf, content);
+        let buf = terminal.backend().buffer();
+        let layout = crate::tui::render::layout::RootLayout::new(Blade::Inbox)
+            .compute(ratatui::layout::Rect::new(0, 0, 120, 28));
+        let content = layout.active_content();
+        let selected_y = find_selected_row(buf, content);
 
-            let mut bad = 0u32;
-            let mut report = String::new();
-            for x in content.left()..content.right() {
-                let bg = buf.cell((x, selected_y)).unwrap().style().bg;
-                if !matches!(bg, Some(crate::tui::render::theme::SURFACE0)) {
-                    bad += 1;
-                    report.push_str(&format!("x={x} bg={bg:?}\n"));
-                }
+        let mut bad = 0u32;
+        let mut report = String::new();
+        for x in content.left()..content.right() {
+            let bg = buf.cell((x, selected_y)).unwrap().style().bg;
+            if !matches!(bg, Some(crate::tui::render::theme::SURFACE0)) {
+                bad += 1;
+                report.push_str(&format!("x={x} bg={bg:?}\n"));
             }
-            assert_eq!(
-                bad, 0,
-                "selected row not fully highlighted (osc8={osc8}):\n{report}"
-            );
         }
+        assert_eq!(bad, 0, "selected row not fully highlighted:\n{report}");
     }
 
     fn find_selected_row(buf: &ratatui::buffer::Buffer, content: ratatui::layout::Rect) -> u16 {
