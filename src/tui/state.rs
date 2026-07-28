@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::api::{group_key, PrListResponse, PrSummary};
+use crate::api::{PrListResponse, PrSummary};
 use crate::github::types::{PrGroup, Priority};
 use crate::tui::app::AppState;
 use crate::tui::render::layout::{Blade, ViewLayout};
@@ -93,14 +93,108 @@ impl ScrollState {
     }
 }
 
+/// A rendered section of the Inbox. Most map 1:1 to a `PrGroup`; `Dependencies`
+/// is synthetic — bot-authored PRs pulled out of the review lane so they don't
+/// bury human review work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboxSection {
+    Group(PrGroup),
+    Dependencies,
+}
+
+impl InboxSection {
+    /// Human-readable section header label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            InboxSection::Group(PrGroup::AuthoredActionNeeded) => "MINE — ACTION NEEDED",
+            InboxSection::Group(PrGroup::AuthoredReadyToMerge) => "MINE — READY TO MERGE",
+            InboxSection::Group(PrGroup::AuthoredWaiting) => "MINE — WAITING",
+            InboxSection::Group(PrGroup::ReviewNeeded) => "REVIEW — BLOCKED ON ME",
+            InboxSection::Group(PrGroup::ReviewUpdate) => "REVIEW — NEW COMMITS",
+            InboxSection::Group(PrGroup::ReviewDone) => "REVIEW — DONE",
+            InboxSection::Group(PrGroup::Draft) => "DRAFTS",
+            InboxSection::Group(PrGroup::Other) => "INVOLVED",
+            InboxSection::Dependencies => "DEPENDENCIES",
+        }
+    }
+
+    /// Sections that start folded on launch: low-signal buckets the user rarely
+    /// needs open. A section with no explicit entry in `collapsed_sections`
+    /// inherits this default.
+    pub fn default_collapsed(&self) -> bool {
+        matches!(
+            self,
+            InboxSection::Group(PrGroup::ReviewDone)
+                | InboxSection::Group(PrGroup::Draft)
+                | InboxSection::Dependencies
+        )
+    }
+
+    /// Sections in render order. `Dependencies` sits between the review lane's
+    /// active work and its done pile.
+    pub fn render_order() -> &'static [InboxSection] {
+        &[
+            InboxSection::Group(PrGroup::AuthoredActionNeeded),
+            InboxSection::Group(PrGroup::AuthoredReadyToMerge),
+            InboxSection::Group(PrGroup::AuthoredWaiting),
+            InboxSection::Group(PrGroup::ReviewNeeded),
+            InboxSection::Group(PrGroup::ReviewUpdate),
+            InboxSection::Dependencies,
+            InboxSection::Group(PrGroup::ReviewDone),
+            InboxSection::Group(PrGroup::Draft),
+            InboxSection::Group(PrGroup::Other),
+        ]
+    }
+}
+
+/// One rendered line of the Inbox body, in display order. This is the single
+/// source of truth for what the Inbox shows: `ViewStateManager::prepare`
+/// builds it once via `build_inbox_rows`, and both selection/scroll math and
+/// `render_inbox` consume it rather than recomputing grouping/order.
+///
+/// A `Header` is always emitted for a non-empty section, even when collapsed;
+/// its `count` is the section's TRUE PR count regardless of fold state. When
+/// `collapsed`, the section's `Pr` rows are omitted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboxRow {
+    Header {
+        section: InboxSection,
+        count: usize,
+        collapsed: bool,
+    },
+    Pr {
+        id: String,
+    },
+}
+
+/// The Inbox cursor's identity. Section headers are selectable, so the cursor
+/// can rest on a header (`Section`) or a PR row (`Pr`). This id-based anchor
+/// (not a raw row index) is authoritative: `prepare` re-resolves it to a row
+/// index every frame, so a rebuild that reorders or filters rows can't silently
+/// move the cursor onto a different item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxCursor {
+    Section(InboxSection),
+    Pr(String),
+}
+
 /// All transient view state for the TUI.
 #[derive(Debug, Clone)]
 pub struct ViewState {
     pub active_blade: Blade,
-    pub selected_index: usize,
+    /// Cursor position in `inbox_rows` (row space, so it includes header rows).
+    /// Derived every frame from `inbox_cursor`; see that field.
+    pub selected_row: usize,
     pub selected_file_index: usize,
     pub overview_focus: OverviewFocus,
-    pub collapsed_groups: HashMap<String, bool>,
+    /// Whether the Overview DESCRIPTION section is fully expanded (toggled by `d`).
+    /// Defaults to collapsed so the catch-up sections aren't pushed below the fold.
+    pub overview_description_expanded: bool,
+    /// Per-section fold state. Sections absent from the map inherit
+    /// `InboxSection::default_collapsed()`.
+    pub collapsed_sections: HashMap<InboxSection, bool>,
+    /// Authoritative Inbox cursor identity; `selected_row` is its resolved index.
+    pub inbox_cursor: InboxCursor,
 
     pub inbox_scroll: ScrollState,
     pub overview_summary_scroll: ScrollState,
@@ -111,8 +205,9 @@ pub struct ViewState {
     pub files_scroll: ScrollState,
     pub diff_scroll: ScrollState,
 
-    /// Flat list of PR ids in Inbox display order.
-    pub flat_prs: Vec<String>,
+    /// Rendered Inbox rows (section headers + PR rows), in display order.
+    /// The single source of truth for Inbox grouping/order; see `InboxRow`.
+    pub inbox_rows: Vec<InboxRow>,
 }
 
 impl Default for ViewState {
@@ -125,10 +220,14 @@ impl ViewState {
     pub fn new() -> Self {
         Self {
             active_blade: Blade::Inbox,
-            selected_index: 0,
+            selected_row: 0,
             selected_file_index: 0,
             overview_focus: OverviewFocus::Summary,
-            collapsed_groups: HashMap::new(),
+            overview_description_expanded: false,
+            collapsed_sections: HashMap::new(),
+            // Sentinel that matches no row; the first `prepare` falls back to the
+            // first PR row.
+            inbox_cursor: InboxCursor::Pr(String::new()),
             inbox_scroll: ScrollState::new(),
             overview_summary_scroll: ScrollState::new(),
             overview_description_scroll: ScrollState::new(),
@@ -137,7 +236,7 @@ impl ViewState {
             activity_scroll: ScrollState::new(),
             files_scroll: ScrollState::new(),
             diff_scroll: ScrollState::new(),
-            flat_prs: Vec::new(),
+            inbox_rows: Vec::new(),
         }
     }
 
@@ -188,6 +287,11 @@ impl ViewState {
 /// Owns `ViewState` and reconciles it with domain state before each render.
 pub struct ViewStateManager {
     pub view: ViewState,
+    /// The `selected_pr_id` last seen by `prepare`, used to detect a genuine
+    /// selection change (navigation, or the selected PR disappearing) versus
+    /// the same PR simply moving to a new position in a rebuilt `flat_prs`
+    /// (e.g. after an LLM reclassification changes sort order).
+    last_selected_pr_id: Option<String>,
 }
 
 impl Default for ViewStateManager {
@@ -200,6 +304,7 @@ impl ViewStateManager {
     pub fn new() -> Self {
         Self {
             view: ViewState::new(),
+            last_selected_pr_id: None,
         }
     }
 
@@ -207,81 +312,67 @@ impl ViewStateManager {
     /// detail/diff reloads when the selected PR changes.
     ///
     /// Contract:
-    /// 1. `view.flat_prs` is rebuilt from `app.prs.groups` and `view.collapsed_groups` in the
-    ///    same order the old `AppState::flat_sorted_pulls` produced: opened-by-me groups first,
-    ///    then review-requested groups, with draft PRs routed by author, and each section sorted
-    ///    by priority then most-recent `updated_at`.
-    /// 2. `view.selected_index` and `app.selected_pr_id` are reconciled. If the PR at the current
-    ///    index disappeared or the id cannot be found, `app.selected_pr_id` is updated, detail
-    ///    and diff reload flags are set, cached detail/diff/scroll state is cleared, and
-    ///    `view.selected_file_index` and all scroll offsets are reset.
+    /// 1. `view.inbox_rows` is rebuilt from `app.prs.groups`, `view.collapsed_sections`, and the
+    ///    active filter: one section per `PrGroup` in `InboxSection::render_order` (bot review-lane
+    ///    PRs split into `DEPENDENCIES`), each sorted by priority then most-recent `updated_at`,
+    ///    with a selectable header row before each non-empty section.
+    /// 2. `view.inbox_cursor` (a section- or PR-identity anchor) is authoritative. `view.selected_row`
+    ///    is a derived cache of that anchor's row index, resynced here every call so a data refresh
+    ///    that reorders/filters the list can't silently move the cursor onto a different item. If the
+    ///    anchor no longer resolves (PR disappeared, section emptied, filtered out), the cursor falls
+    ///    back to the first PR row. `app.selected_pr_id` — the PR whose detail is shown — follows the
+    ///    cursor: the selected PR, or the first PR of the section when the cursor rests on a header.
+    ///    Only a genuine identity change (not just a reordering) triggers detail/diff reload: cached
+    ///    detail/diff/scroll state is cleared, and `view.selected_file_index` and all scroll offsets
+    ///    are reset.
     /// 3. Scroll offsets are clamped to the currently rendered content lengths held in
     ///    `app.render_cache` and the blade viewport geometries in `layout`.
-    /// 4. The selected PR and selected file are kept visible within their scroll viewports.
+    /// 4. The selected row and selected file are kept visible within their scroll viewports.
     pub fn prepare(&mut self, app: &mut AppState, layout: &ViewLayout) {
-        let current_user = app
-            .health
-            .as_ref()
-            .map(|h| h.current_user.as_str())
-            .unwrap_or("");
+        // 1. Recompute the Inbox row list (headers + PRs).
+        self.view.inbox_rows =
+            build_inbox_rows(&app.prs, &self.view.collapsed_sections, &app.search_filter);
 
-        // 1. Recompute flattened PR list.
-        let (opened_len, review_len, flat_prs) =
-            build_flat_prs(&app.prs, &self.view.collapsed_groups, current_user);
-        self.view.flat_prs = flat_prs;
+        // 2. Reconcile the cursor. See the anchor-vs-index contract note above.
+        let selected_row = resolve_cursor_row(&self.view.inbox_rows, &self.view.inbox_cursor)
+            .or_else(|| {
+                self.view
+                    .inbox_rows
+                    .iter()
+                    .position(|r| matches!(r, InboxRow::Pr { .. }))
+            })
+            .unwrap_or(0);
+        self.view.selected_row = selected_row;
+        // Re-anchor to whatever the cursor actually resolved to, so a fallback
+        // updates the identity we track from here on.
+        if let Some(cursor) = cursor_of_row(&self.view.inbox_rows, selected_row) {
+            self.view.inbox_cursor = cursor;
+        }
+        app.selected_pr_id = selected_pr_for_row(&self.view.inbox_rows, selected_row);
 
-        let header_count = visible_header_count(opened_len, review_len);
-
-        // 2. Reconcile selection.
-        // `view.selected_index` is authoritative: if the PR at that index differs from
-        // `app.selected_pr_id`, we switch to the new PR and request fresh detail/diff.
-        if self.view.flat_prs.is_empty() {
-            self.view.selected_index = 0;
-            if app.selected_pr_id.is_some() {
-                app.selected_pr_id = None;
-                app.detail_needs_reload = true;
-                app.diff_needs_reload = true;
-                app.pr_detail = None;
-                app.pr_diff = None;
-                app.diff_lines = Vec::new();
-                app.diff_comments = HashMap::new();
-                self.view.selected_file_index = 0;
-                self.view.reset_scroll_offsets();
-                app.render_cache.clear();
-            }
-        } else {
-            if self.view.selected_index >= self.view.flat_prs.len() {
-                self.view.selected_index = self.view.flat_prs.len() - 1;
-            }
-            let expected_id = self
-                .view
-                .flat_prs
-                .get(self.view.selected_index)
-                .map(|s| s.as_str());
-            if app.selected_pr_id.as_deref() != expected_id {
-                app.selected_pr_id = expected_id.map(|s| s.to_string());
-                app.detail_needs_reload = true;
-                app.diff_needs_reload = true;
-                app.pr_detail = None;
-                app.pr_diff = None;
-                app.diff_lines = Vec::new();
-                app.diff_comments = HashMap::new();
-                self.view.selected_file_index = 0;
-                self.view.reset_scroll_offsets();
-                app.render_cache.clear();
-            }
+        if app.selected_pr_id != self.last_selected_pr_id {
+            app.detail_needs_reload = true;
+            app.diff_needs_reload = true;
+            app.pr_detail = None;
+            app.pr_diff = None;
+            self.view.selected_file_index = 0;
+            self.view.reset_scroll_offsets();
+            self.last_selected_pr_id = app.selected_pr_id.clone();
         }
 
-        // 3. Rebuild render caches so content lengths are current for this frame.
-        if let Some(detail) = app.pr_detail.as_ref() {
-            app.render_cache.rebuild_activity(
-                Some(detail),
-                layout.blade(Blade::Activity).content.width,
-                16,
-            );
-            app.render_cache
-                .rebuild_overview(Some(detail), layout.blade(Blade::Overview).content.width);
-        }
+        // 4. Rebuild render caches so content lengths are current for this
+        // frame. Each `rebuild_*` call is keyed on `app.pr_detail`'s identity
+        // (see `RenderCache`), so passing `None` here (no PR selected, or one
+        // just deselected) naturally rebuilds sections back down to their
+        // empty/placeholder content instead of leaving stale output behind.
+        app.render_cache.rebuild_activity(
+            app.pr_detail.as_ref(),
+            layout.blade(Blade::Activity).content.width,
+        );
+        app.render_cache.rebuild_overview(
+            app.pr_detail.as_ref(),
+            layout.blade(Blade::Overview).content.width,
+        );
         app.render_cache.rebuild_diff(
             app.pr_detail.as_ref(),
             app.pr_diff.as_ref().map(|d| d.diff.as_str()),
@@ -289,13 +380,13 @@ impl ViewStateManager {
             app.show_line_numbers,
         );
 
-        // 4. Clamp scroll offsets using the rebuilt cache lengths and current viewports.
+        // 5. Clamp scroll offsets using the rebuilt cache lengths and current viewports.
         // The Inbox blade reserves one row for its non-scrolling column header,
         // so the scrollable viewport is one row shorter than the active content area.
         let inbox_viewport = layout.blade(Blade::Inbox).content.height.saturating_sub(1) as usize;
         self.view
             .inbox_scroll
-            .set_content_viewport(self.view.flat_prs.len() + header_count, inbox_viewport);
+            .set_content_viewport(self.view.inbox_rows.len(), inbox_viewport);
 
         let file_count = app.pr_detail.as_ref().map_or(0, |d| d.files.len());
         // The Files blade reserves one row for its non-scrolling header, so the
@@ -323,7 +414,13 @@ impl ViewStateManager {
         // content that overflows a section's slice.
         let lens = [
             app.render_cache.overview_summary.len(),
-            app.render_cache.overview_description.len(),
+            // Collapse-aware: match the Description rows `render_body_rows`
+            // actually shows, so scroll clamping doesn't reserve height for
+            // lines hidden behind the "d to expand" marker.
+            crate::tui::views::overview::description_display_line_count(
+                app.render_cache.overview_description.len(),
+                self.view.overview_description_expanded,
+            ),
             app.render_cache.overview_checks.len(),
         ];
         let overview_body = layout
@@ -337,30 +434,23 @@ impl ViewStateManager {
             self.view.overview_focus,
         );
         // Each scrollable section reserves one row for its header label.
-        self.view.overview_summary_scroll.set_content_viewport(
-            lens[0],
-            section_heights[0].saturating_sub(1) as usize,
-        );
-        self.view.overview_description_scroll.set_content_viewport(
-            lens[1],
-            section_heights[1].saturating_sub(1) as usize,
-        );
-        self.view.overview_checks_scroll.set_content_viewport(
-            lens[2],
-            section_heights[2].saturating_sub(1) as usize,
-        );
+        self.view
+            .overview_summary_scroll
+            .set_content_viewport(lens[0], section_heights[0].saturating_sub(1) as usize);
+        self.view
+            .overview_description_scroll
+            .set_content_viewport(lens[1], section_heights[1].saturating_sub(1) as usize);
+        self.view
+            .overview_checks_scroll
+            .set_content_viewport(lens[2], section_heights[2].saturating_sub(1) as usize);
         self.view
             .overview_last_activity_scroll
             .set_content_viewport(1, section_heights[3] as usize);
 
-        // 5. Keep selected items visible.
-        // The Inbox scroll offset is measured in screen lines that include
-        // section headers, so convert the flat PR index to its line index before
-        // calling keep_visible.
-        if !self.view.flat_prs.is_empty() {
-            let line_idx =
-                flat_index_to_line_index(self.view.selected_index, opened_len, review_len);
-            self.view.inbox_scroll.keep_visible(line_idx);
+        // 6. Keep selected items visible. `selected_row` already indexes the
+        // rendered line space (`inbox_rows` includes header rows).
+        if !self.view.inbox_rows.is_empty() {
+            self.view.inbox_scroll.keep_visible(self.view.selected_row);
         }
         if file_count > 0 {
             self.view
@@ -379,39 +469,86 @@ fn priority_rank(p: Option<&Priority>) -> u8 {
     }
 }
 
-/// Return `(opened_count, review_count, flat_ids)` for the Inbox display.
-fn build_flat_prs(
-    prs: &PrListResponse,
-    collapsed: &HashMap<String, bool>,
-    current_user: &str,
-) -> (usize, usize, Vec<String>) {
-    let mut opened: Vec<&PrSummary> = Vec::new();
-    let mut review: Vec<&PrSummary> = Vec::new();
+/// Row index the cursor anchor resolves to in the current row list, if present.
+fn resolve_cursor_row(rows: &[InboxRow], cursor: &InboxCursor) -> Option<usize> {
+    rows.iter().position(|row| match (row, cursor) {
+        (InboxRow::Header { section, .. }, InboxCursor::Section(s)) => section == s,
+        (InboxRow::Pr { id }, InboxCursor::Pr(cid)) => id == cid,
+        _ => false,
+    })
+}
 
+/// The cursor anchor identity for the row at `row`, if any.
+fn cursor_of_row(rows: &[InboxRow], row: usize) -> Option<InboxCursor> {
+    match rows.get(row)? {
+        InboxRow::Header { section, .. } => Some(InboxCursor::Section(*section)),
+        InboxRow::Pr { id } => Some(InboxCursor::Pr(id.clone())),
+    }
+}
+
+/// The PR whose detail the cursor implies: the PR at `row` when it's a PR row,
+/// otherwise the first PR of the section whose header sits at `row`. `None` when
+/// the row is a header of a folded (or empty) section.
+fn selected_pr_for_row(rows: &[InboxRow], row: usize) -> Option<String> {
+    match rows.get(row)? {
+        InboxRow::Pr { id } => Some(id.clone()),
+        InboxRow::Header { .. } => match rows.get(row + 1)? {
+            InboxRow::Pr { id } => Some(id.clone()),
+            InboxRow::Header { .. } => None,
+        },
+    }
+}
+
+/// True for machine authors, whose review-lane PRs are routed into the
+/// `DEPENDENCIES` section. Prefers the GraphQL actor type carried on the summary;
+/// the `[bot]` suffix is a fallback for PRs cached before that field existed
+/// (note the daemon's GraphQL returns bot logins WITHOUT a `[bot]` suffix, so
+/// the flag is what actually fires in normal operation).
+fn is_bot_author(pr: &PrSummary) -> bool {
+    pr.author_is_bot || pr.author.ends_with("[bot]")
+}
+
+/// Build the Inbox row list (section headers + PR rows) in display order. This
+/// is the ONLY place that decides Inbox grouping/order: `prepare` uses it for
+/// selection/scroll math, and `render_inbox` maps it straight to screen lines.
+///
+/// One section per `PrGroup` (in `InboxSection::render_order`), except review-lane
+/// PRs authored by bots, which are pulled into a synthetic `DEPENDENCIES` section.
+/// Empty sections are skipped. Each non-empty section emits a `Header` (with its
+/// TRUE count) followed by its PR rows, unless the section is folded, in which
+/// case only the header is emitted. PRs within a section are sorted by priority
+/// then most-recent `updated_at`.
+fn build_inbox_rows(
+    prs: &PrListResponse,
+    collapsed: &HashMap<InboxSection, bool>,
+    filter: &str,
+) -> Vec<InboxRow> {
+    let mut sections: HashMap<InboxSection, Vec<&PrSummary>> = HashMap::new();
     for group in PrGroup::all_in_priority_order() {
-        let key = group_key(group);
-        if *collapsed.get(&key).unwrap_or(&false) {
+        let Some(list) = prs.groups.get(group) else {
             continue;
-        }
-        if let Some(prs) = prs.groups.get(&key) {
-            for pr in prs {
-                match group {
-                    PrGroup::AuthoredActionNeeded
-                    | PrGroup::AuthoredReadyToMerge
-                    | PrGroup::AuthoredWaiting => opened.push(pr),
-                    PrGroup::ReviewNeeded | PrGroup::ReviewUpdate | PrGroup::ReviewDone => {
-                        review.push(pr)
-                    }
-                    PrGroup::Draft => {
-                        if pr.author == current_user {
-                            opened.push(pr);
-                        } else {
-                            review.push(pr);
-                        }
-                    }
-                    PrGroup::Other => review.push(pr),
-                }
+        };
+        for pr in list {
+            if !pr.matches_filter(filter) {
+                continue;
             }
+            // Bot-authored PRs anyone might be asked to look at (review lane or
+            // merely involved) fold into DEPENDENCIES so the human sections stay
+            // human. Authored/draft lanes keep bot PRs in place: those are the
+            // user's own responsibility regardless of who opened them.
+            let is_review_or_involved = matches!(
+                group,
+                PrGroup::ReviewNeeded
+                    | PrGroup::ReviewUpdate
+                    | PrGroup::ReviewDone
+                    | PrGroup::Other
+            );
+            let section = if is_review_or_involved && is_bot_author(pr) {
+                InboxSection::Dependencies
+            } else {
+                InboxSection::Group(*group)
+            };
+            sections.entry(section).or_default().push(pr);
         }
     }
 
@@ -421,39 +558,29 @@ fn build_flat_prs(
             .then_with(|| b.updated_at.cmp(&a.updated_at))
     };
 
-    opened.sort_by(sort_fn);
-    review.sort_by(sort_fn);
-
-    let opened_len = opened.len();
-    let review_len = review.len();
-    let mut flat: Vec<String> = Vec::with_capacity(opened_len + review_len);
-    flat.extend(opened.into_iter().map(|p| p.id.clone()));
-    flat.extend(review.into_iter().map(|p| p.id.clone()));
-    (opened_len, review_len, flat)
-}
-
-fn visible_header_count(opened_len: usize, review_len: usize) -> usize {
-    let mut count = 0;
-    if opened_len > 0 {
-        count += 1;
+    let mut rows: Vec<InboxRow> = Vec::new();
+    for section in InboxSection::render_order() {
+        let Some(list) = sections.get_mut(section) else {
+            continue;
+        };
+        if list.is_empty() {
+            continue;
+        }
+        list.sort_by(sort_fn);
+        let is_collapsed = collapsed
+            .get(section)
+            .copied()
+            .unwrap_or_else(|| section.default_collapsed());
+        rows.push(InboxRow::Header {
+            section: *section,
+            count: list.len(),
+            collapsed: is_collapsed,
+        });
+        if !is_collapsed {
+            rows.extend(list.iter().map(|p| InboxRow::Pr { id: p.id.clone() }));
+        }
     }
-    if review_len > 0 {
-        count += 1;
-    }
-    count
-}
-
-/// Map a flat PR index into the line index of the rendered Inbox list, which
-/// contains a section header before each non-empty group.
-fn flat_index_to_line_index(selected_index: usize, opened_len: usize, review_len: usize) -> usize {
-    let mut line = selected_index;
-    if opened_len > 0 {
-        line += 1;
-    }
-    if selected_index >= opened_len && review_len > 0 {
-        line += 1;
-    }
-    line
+    rows
 }
 
 #[cfg(test)]
@@ -461,10 +588,15 @@ mod tests {
     use super::*;
     use crate::api::{HealthResponse, PrSummary};
     use crate::config::Config;
-    use crate::github::types::Priority;
+    use crate::github::types::{CheckStatus, PrGroup, Priority};
     use crate::tui::client::DaemonClient;
 
-    fn make_summary(id: &str, group: &str, author: &str, priority: Option<Priority>) -> PrSummary {
+    fn make_summary(
+        id: &str,
+        group: PrGroup,
+        author: &str,
+        priority: Option<Priority>,
+    ) -> PrSummary {
         PrSummary {
             id: id.to_string(),
             node_id: "node".to_string(),
@@ -473,9 +605,10 @@ mod tests {
             number: id.split('~').next_back().unwrap().parse().unwrap_or(1),
             title: format!("Test {}", id),
             author: author.to_string(),
-            group: group.to_string(),
+            author_is_bot: false,
+            group,
             next_action: "Review now".to_string(),
-            check_status: "none".to_string(),
+            check_status: CheckStatus::None,
             llm_priority: priority,
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             url: "https://example.com".to_string(),
@@ -483,7 +616,7 @@ mod tests {
         }
     }
 
-    fn make_test_state(groups: HashMap<String, Vec<PrSummary>>) -> AppState {
+    fn make_test_state(groups: HashMap<PrGroup, Vec<PrSummary>>) -> AppState {
         let config = Config::default();
         let client = DaemonClient::new(config.daemon.port).unwrap();
         let mut state = AppState::new(config, client);
@@ -502,8 +635,39 @@ mod tests {
             refresh_in_progress: false,
             setup_status: "ready".to_string(),
             setup_message: None,
+            binary_mtime: None,
         });
         state
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn summary_with_fields(
+        id: &str,
+        group: PrGroup,
+        title: &str,
+        author: &str,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        next_action: &str,
+    ) -> PrSummary {
+        PrSummary {
+            id: id.to_string(),
+            node_id: "node".to_string(),
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            title: title.to_string(),
+            author: author.to_string(),
+            author_is_bot: false,
+            group,
+            next_action: next_action.to_string(),
+            check_status: CheckStatus::None,
+            llm_priority: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            url: "https://example.com".to_string(),
+            comments: 0,
+        }
     }
 
     fn make_layout(width: u16, height: u16, active: Blade) -> ViewLayout {
@@ -512,64 +676,366 @@ mod tests {
     }
 
     #[test]
-    fn flat_prs_order_opened_by_me_first_then_review() {
+    fn pr_matches_filter_case_insensitive_fields() {
+        let pr = summary_with_fields(
+            "Acme~widgets~42",
+            PrGroup::ReviewNeeded,
+            "Fix Login Bug",
+            "Alice",
+            "Acme",
+            "widgets",
+            42,
+            "Review now",
+        );
+
+        assert!(pr.matches_filter(""));
+        assert!(pr.matches_filter("bug"));
+        assert!(pr.matches_filter("BUG"));
+        assert!(pr.matches_filter("alice"));
+        assert!(pr.matches_filter("ALICE"));
+        assert!(pr.matches_filter("widgets"));
+        assert!(pr.matches_filter("acme"));
+        assert!(pr.matches_filter("42"));
+        assert!(pr.matches_filter("acme~widgets~42"));
+        assert!(pr.matches_filter("review now"));
+        assert!(!pr.matches_filter("zzz"));
+        assert!(!pr.matches_filter("99"));
+    }
+
+    /// Extract just the PR ids (in order) from a row list, dropping headers.
+    fn pr_ids(rows: &[InboxRow]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| match row {
+                InboxRow::Pr { id } => Some(id.clone()),
+                InboxRow::Header { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_flat_prs_filters_and_preserves_lane_counts() {
         let mut groups = HashMap::new();
         groups.insert(
-            "review_needed".to_string(),
+            PrGroup::AuthoredWaiting,
+            vec![
+                summary_with_fields(
+                    "x~y~1",
+                    PrGroup::AuthoredWaiting,
+                    "Alpha feature",
+                    "me",
+                    "x",
+                    "y",
+                    1,
+                    "Waiting",
+                ),
+                summary_with_fields(
+                    "x~y~2",
+                    PrGroup::AuthoredWaiting,
+                    "Beta patch",
+                    "me",
+                    "x",
+                    "y",
+                    2,
+                    "Waiting",
+                ),
+            ],
+        );
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![
+                summary_with_fields(
+                    "x~y~3",
+                    PrGroup::ReviewNeeded,
+                    "Gamma fix",
+                    "other",
+                    "x",
+                    "y",
+                    3,
+                    "Review now",
+                ),
+                summary_with_fields(
+                    "x~y~4",
+                    PrGroup::ReviewNeeded,
+                    "Delta docs",
+                    "other",
+                    "x",
+                    "y",
+                    4,
+                    "Review now",
+                ),
+            ],
+        );
+
+        let prs = PrListResponse {
+            groups,
+            updated_at: String::new(),
+        };
+        let collapsed = HashMap::new();
+
+        let rows = build_inbox_rows(&prs, &collapsed, "alpha");
+        assert_eq!(pr_ids(&rows), vec!["x~y~1"], "only one authored PR matches");
+
+        let rows = build_inbox_rows(&prs, &collapsed, "3");
+        assert_eq!(pr_ids(&rows), vec!["x~y~3"]);
+
+        let rows = build_inbox_rows(&prs, &collapsed, "");
+        assert_eq!(pr_ids(&rows), vec!["x~y~1", "x~y~2", "x~y~3", "x~y~4"]);
+    }
+
+    #[test]
+    fn prepare_preserves_selected_pr_id_on_filter_change() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![
+                summary_with_fields(
+                    "o~r~1",
+                    PrGroup::ReviewNeeded,
+                    "First",
+                    "other",
+                    "o",
+                    "r",
+                    1,
+                    "Review now",
+                ),
+                summary_with_fields(
+                    "o~r~2",
+                    PrGroup::ReviewNeeded,
+                    "Second",
+                    "other",
+                    "o",
+                    "r",
+                    2,
+                    "Review now",
+                ),
+                summary_with_fields(
+                    "o~r~3",
+                    PrGroup::ReviewNeeded,
+                    "Third",
+                    "other",
+                    "o",
+                    "r",
+                    3,
+                    "Review now",
+                ),
+            ],
+        );
+        let mut app = make_test_state(groups);
+        let mut view = ViewStateManager::new();
+        let layout = make_layout(80, 24, Blade::Inbox);
+
+        view.prepare(&mut app, &layout);
+        // Row 0 is the section header; the cursor starts on the first PR row.
+        assert_eq!(view.view.selected_row, 1);
+        assert_eq!(app.selected_pr_id, Some("o~r~1".to_string()));
+        // Row 3 is the third PR (rows: header, o~r~1, o~r~2, o~r~3).
+        app.set_selected_row(&mut view, 3);
+        view.prepare(&mut app, &layout);
+        assert_eq!(app.selected_pr_id, Some("o~r~3".to_string()));
+
+        // Filter to a subset that still includes the selected PR ("First" and
+        // "Third" both contain "ir"); the selected PR follows to its new row.
+        app.search_filter = "ir".to_string();
+        view.prepare(&mut app, &layout);
+        assert_eq!(view.view.selected_row, 2);
+        assert_eq!(app.selected_pr_id, Some("o~r~3".to_string()));
+    }
+
+    #[test]
+    fn prepare_keeps_selection_stable_when_list_reorders_without_navigation() {
+        // Regression test: a data refresh that reorders the list (e.g. an
+        // LLM reclassification changing sort order) must not silently move
+        // the selection to a different PR just because the PR that used to
+        // sit at the selected index changed.
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![
+                make_summary("o~r~a", PrGroup::ReviewNeeded, "other", Some(Priority::Low)),
+                make_summary("o~r~b", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+            ],
+        );
+        let mut app = make_test_state(groups);
+        let mut view = ViewStateManager::new();
+        let layout = make_layout(80, 24, Blade::Inbox);
+
+        view.prepare(&mut app, &layout);
+        // High priority sorts first (row 0 is the section header).
+        assert_eq!(pr_ids(&view.view.inbox_rows), vec!["o~r~b", "o~r~a"]);
+
+        // Select the second PR ("a", currently at row 2).
+        app.set_selected_row(&mut view, 2);
+        view.prepare(&mut app, &layout);
+        assert_eq!(app.selected_pr_id, Some("o~r~a".to_string()));
+        app.detail_needs_reload = false; // simulate detail already loaded
+
+        // Reclassify "a" to High priority: it now sorts first, at index 0,
+        // even though the user's selection (by identity) hasn't moved.
+        for prs in app.prs.groups.values_mut() {
+            for pr in prs.iter_mut() {
+                if pr.id == "o~r~a" {
+                    pr.llm_priority = Some(Priority::High);
+                }
+            }
+        }
+        view.prepare(&mut app, &layout);
+
+        // The list reordered...
+        assert_eq!(pr_ids(&view.view.inbox_rows), vec!["o~r~a", "o~r~b"]);
+        // ...but the selection followed the PR's new position (now row 1, after
+        // the header) instead of staying pinned to a row that changed identity.
+        assert_eq!(view.view.selected_row, 1);
+        assert_eq!(app.selected_pr_id, Some("o~r~a".to_string()));
+        assert!(
+            !app.detail_needs_reload,
+            "reordering under a stable selection must not trigger a reload"
+        );
+    }
+
+    #[test]
+    fn prepare_resets_to_first_match_when_selected_filtered_out() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![
+                summary_with_fields(
+                    "o~r~1",
+                    PrGroup::ReviewNeeded,
+                    "First",
+                    "other",
+                    "o",
+                    "r",
+                    1,
+                    "Review now",
+                ),
+                summary_with_fields(
+                    "o~r~2",
+                    PrGroup::ReviewNeeded,
+                    "Second",
+                    "other",
+                    "o",
+                    "r",
+                    2,
+                    "Review now",
+                ),
+            ],
+        );
+        let mut app = make_test_state(groups);
+        let mut view = ViewStateManager::new();
+        let layout = make_layout(80, 24, Blade::Inbox);
+
+        view.prepare(&mut app, &layout);
+        // Row 2 is the second PR (rows: header, o~r~1, o~r~2).
+        app.set_selected_row(&mut view, 2);
+        view.prepare(&mut app, &layout);
+        assert_eq!(app.selected_pr_id, Some("o~r~2".to_string()));
+
+        // Filter removes the selected PR; selection should move to the first match.
+        app.search_filter = "first".to_string();
+        view.prepare(&mut app, &layout);
+        assert_eq!(view.view.selected_row, 1);
+        assert_eq!(app.selected_pr_id, Some("o~r~1".to_string()));
+    }
+
+    #[test]
+    fn inbox_rows_order_mine_before_review() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
             vec![make_summary(
                 "a~b~1",
-                "review_needed",
+                PrGroup::ReviewNeeded,
                 "other",
                 Some(Priority::High),
             )],
         );
         groups.insert(
-            "authored_waiting".to_string(),
-            vec![make_summary("a~b~2", "authored_waiting", "me", None)],
+            PrGroup::AuthoredWaiting,
+            vec![make_summary("a~b~2", PrGroup::AuthoredWaiting, "me", None)],
         );
 
-        let app = make_test_state(groups);
+        let mut app = make_test_state(groups);
         let mut view = ViewStateManager::new();
         let layout = make_layout(80, 24, Blade::Inbox);
-        view.prepare(&mut { app }, &layout);
-
-        // app moved into closure is not usable; use a fresh call.
-        let mut app = make_test_state({
-            let mut g = HashMap::new();
-            g.insert(
-                "review_needed".to_string(),
-                vec![make_summary(
-                    "a~b~1",
-                    "review_needed",
-                    "other",
-                    Some(Priority::High),
-                )],
-            );
-            g.insert(
-                "authored_waiting".to_string(),
-                vec![make_summary("a~b~2", "authored_waiting", "me", None)],
-            );
-            g
-        });
         view.prepare(&mut app, &layout);
-        assert_eq!(view.view.flat_prs, vec!["a~b~2", "a~b~1"]);
+        // Authored ("MINE — WAITING") sections render before review sections.
+        assert_eq!(pr_ids(&view.view.inbox_rows), vec!["a~b~2", "a~b~1"]);
+    }
+
+    #[test]
+    fn build_inbox_rows_routes_bots_to_dependencies_and_defaults_collapsed() {
+        // A plain "dependabot" login with the bot flag set (the daemon's GraphQL
+        // returns bot logins WITHOUT a "[bot]" suffix), plus a human whose login
+        // merely ends in "bot" — the latter must NOT be routed as a dependency.
+        let mut bot = make_summary("o~r~2", PrGroup::ReviewNeeded, "dependabot", None);
+        bot.author_is_bot = true;
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![
+                make_summary("o~r~1", PrGroup::ReviewNeeded, "cabot", None),
+                bot,
+            ],
+        );
+        let prs = PrListResponse {
+            groups,
+            updated_at: String::new(),
+        };
+        let collapsed = HashMap::new();
+        let rows = build_inbox_rows(&prs, &collapsed, "");
+
+        // The human PR (login "cabot", flag false) stays in the review section;
+        // the bot PR is pulled into a DEPENDENCIES section collapsed by default.
+        let sections: Vec<InboxSection> = rows
+            .iter()
+            .filter_map(|r| match r {
+                InboxRow::Header { section, .. } => Some(*section),
+                InboxRow::Pr { .. } => None,
+            })
+            .collect();
+        assert!(sections.contains(&InboxSection::Group(PrGroup::ReviewNeeded)));
+        assert!(sections.contains(&InboxSection::Dependencies));
+
+        let dep_header = rows
+            .iter()
+            .find(|r| matches!(r, InboxRow::Header { section: InboxSection::Dependencies, .. }))
+            .unwrap();
+        assert_eq!(
+            *dep_header,
+            InboxRow::Header {
+                section: InboxSection::Dependencies,
+                count: 1,
+                collapsed: true,
+            }
+        );
+        // Only the human PR is visible; the bot PR is folded away by default.
+        assert_eq!(pr_ids(&rows), vec!["o~r~1"]);
     }
 
     #[test]
     fn prepare_resets_selection_when_pr_disappears() {
         let mut groups = HashMap::new();
         groups.insert(
-            "review_needed".to_string(),
-            vec![make_summary("a~b~1", "review_needed", "other", None)],
+            PrGroup::ReviewNeeded,
+            vec![make_summary("a~b~1", PrGroup::ReviewNeeded, "other", None)],
         );
         let mut app = make_test_state(groups);
         app.selected_pr_id = Some("a~b~1".to_string());
 
         let mut view = ViewStateManager::new();
-        view.view.selected_index = 0;
         let layout = make_layout(80, 24, Blade::Inbox);
         view.prepare(&mut app, &layout);
         assert_eq!(app.selected_pr_id, Some("a~b~1".to_string()));
+        // First time this PR becomes selected from the manager's
+        // perspective: detail/diff need to be fetched.
+        assert!(app.detail_needs_reload);
+
+        // Simulate the detail having been fetched (as the real event loop
+        // would do after a DetailLoaded event), then re-run prepare with
+        // nothing changed — an unchanged selection must not re-trigger reload.
+        app.detail_needs_reload = false;
+        app.diff_needs_reload = false;
+        view.prepare(&mut app, &layout);
         assert!(!app.detail_needs_reload);
 
         // Now remove the PR and run prepare again.
@@ -581,9 +1047,8 @@ mod tests {
         assert!(app.diff_needs_reload);
         assert!(app.pr_detail.is_none());
         assert!(app.pr_diff.is_none());
-        assert!(app.diff_lines.is_empty());
-        assert!(app.diff_comments.is_empty());
-        assert_eq!(view.view.selected_index, 0);
+        assert!(app.render_cache.diff_lines.is_empty());
+        assert_eq!(view.view.selected_row, 0);
         assert_eq!(view.view.selected_file_index, 0);
         assert_eq!(view.view.inbox_scroll.offset, 0);
         assert_eq!(view.view.files_scroll.offset, 0);
@@ -596,12 +1061,12 @@ mod tests {
         for i in 0..100 {
             prs.push(make_summary(
                 &format!("a~b~{}", i),
-                "review_needed",
+                PrGroup::ReviewNeeded,
                 "other",
                 None,
             ));
         }
-        groups.insert("review_needed".to_string(), prs);
+        groups.insert(PrGroup::ReviewNeeded, prs);
         let mut app = make_test_state(groups);
         app.selected_pr_id = Some("a~b~0".to_string());
 
@@ -626,19 +1091,113 @@ mod tests {
         );
     }
 
+    /// Build a `PrListResponse` with `opened_count` authored PRs and
+    /// `review_count` review-requested PRs, for row-shape tests below.
+    fn make_prs_of_sizes(opened_count: usize, review_count: usize) -> PrListResponse {
+        let mut groups = HashMap::new();
+        if opened_count > 0 {
+            groups.insert(
+                PrGroup::AuthoredWaiting,
+                (0..opened_count)
+                    .map(|i| make_summary(&format!("o~o~{i}"), PrGroup::AuthoredWaiting, "me", None))
+                    .collect(),
+            );
+        }
+        if review_count > 0 {
+            groups.insert(
+                PrGroup::ReviewNeeded,
+                (0..review_count)
+                    .map(|i| make_summary(&format!("r~r~{i}"), PrGroup::ReviewNeeded, "other", None))
+                    .collect(),
+            );
+        }
+        PrListResponse {
+            groups,
+            updated_at: String::new(),
+        }
+    }
+
     #[test]
-    fn flat_index_to_line_index_accounts_for_section_headers() {
-        // review only
-        assert_eq!(flat_index_to_line_index(0, 0, 5), 1);
-        assert_eq!(flat_index_to_line_index(4, 0, 5), 5);
-        // opened only
-        assert_eq!(flat_index_to_line_index(0, 5, 0), 1);
-        assert_eq!(flat_index_to_line_index(4, 5, 0), 5);
-        // both groups
-        assert_eq!(flat_index_to_line_index(0, 3, 4), 1);
-        assert_eq!(flat_index_to_line_index(2, 3, 4), 3);
-        assert_eq!(flat_index_to_line_index(3, 3, 4), 5);
-        assert_eq!(flat_index_to_line_index(6, 3, 4), 8);
+    fn build_inbox_rows_places_headers_before_each_non_empty_section() {
+        let collapsed = HashMap::new();
+
+        // review only: header at index 0, then all PR rows.
+        let rows = build_inbox_rows(&make_prs_of_sizes(0, 5), &collapsed, "");
+        assert_eq!(
+            rows[0],
+            InboxRow::Header {
+                section: InboxSection::Group(PrGroup::ReviewNeeded),
+                count: 5,
+                collapsed: false,
+            }
+        );
+        assert_eq!(rows.len(), 6);
+
+        // opened only: header at index 0, then all PR rows.
+        let rows = build_inbox_rows(&make_prs_of_sizes(5, 0), &collapsed, "");
+        assert_eq!(
+            rows[0],
+            InboxRow::Header {
+                section: InboxSection::Group(PrGroup::AuthoredWaiting),
+                count: 5,
+                collapsed: false,
+            }
+        );
+        assert_eq!(rows.len(), 6);
+
+        // both sections: authored header, its PRs, then review header, its PRs.
+        let rows = build_inbox_rows(&make_prs_of_sizes(3, 4), &collapsed, "");
+        assert_eq!(
+            rows[0],
+            InboxRow::Header {
+                section: InboxSection::Group(PrGroup::AuthoredWaiting),
+                count: 3,
+                collapsed: false,
+            }
+        );
+        assert_eq!(
+            rows[4],
+            InboxRow::Header {
+                section: InboxSection::Group(PrGroup::ReviewNeeded),
+                count: 4,
+                collapsed: false,
+            }
+        );
+        assert_eq!(rows.len(), 3 + 4 + 2);
+    }
+
+    #[test]
+    fn build_inbox_rows_only_headers_non_empty_sections_with_matching_counts() {
+        let collapsed = HashMap::new();
+
+        // Empty section produces no header at all, not a header with count 0.
+        let rows = build_inbox_rows(&make_prs_of_sizes(0, 3), &collapsed, "");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, InboxRow::Header { .. }))
+                .count(),
+            1,
+            "no header row for the empty authored section"
+        );
+
+        // Each Header's count matches the number of Pr rows that follow it
+        // (up to the next Header or the end of the list).
+        let rows = build_inbox_rows(&make_prs_of_sizes(3, 4), &collapsed, "");
+        let mut i = 0;
+        while i < rows.len() {
+            if let InboxRow::Header { count, .. } = &rows[i] {
+                let mut actual = 0;
+                let mut j = i + 1;
+                while j < rows.len() && matches!(rows[j], InboxRow::Pr { .. }) {
+                    actual += 1;
+                    j += 1;
+                }
+                assert_eq!(actual, *count, "header count must match following PR rows");
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     #[test]

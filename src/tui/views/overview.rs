@@ -5,13 +5,15 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::api::PrDetailResponse;
-use crate::github::types::Priority;
+use crate::github::types::{
+    CheckStatus, MergeableState, Priority, ReviewDecision, TimelineEventType,
+};
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::layout::fill;
 use crate::tui::render::primitives::ScrollViewport;
 use crate::tui::render::theme::{
-    ADD, BASE, DEL, DRAFT, HUNK, ICON_COMMENT, ICON_DIFF_ADDED, ICON_DIFF_REMOVED, ICON_FILES,
-    MANTLE, MED, MUTED, OPEN, OVERLAY0, OVERVIEW, SUBTEXT0, SURFACE0, TEXT,
+    ADD, BASE, DEL, DRAFT, MANTLE, MED, MUTED, OPEN, OVERLAY0, OVERVIEW, PENDING, SUBTEXT0,
+    SURFACE0, TEXT,
 };
 use crate::tui::state::OverviewFocus;
 
@@ -40,29 +42,6 @@ pub fn render_overview(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     render_body_rows(f, chunks[3], detail, ctx);
 }
 
-fn truncate_to_display(s: &str, max_width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    if max_width == 0 {
-        return String::new();
-    }
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    use unicode_width::UnicodeWidthChar;
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w + 1 > max_width {
-            break;
-        }
-        used += w;
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     UnicodeWidthStr::width(s)
@@ -76,7 +55,8 @@ fn render_title(f: &mut Frame, area: Rect, detail: Option<&PrDetailResponse>) {
     match detail {
         Some(d) => {
             let label = format!("#{} {}", d.number, d.title);
-            let truncated = truncate_to_display(&label, area.width as usize);
+            let truncated =
+                crate::tui::views::text::truncate_to_display_width(&label, area.width as usize);
             // Styled as a prominent heading, not a hyperlink: nothing in this
             // blade is OSC-8 clickable, so underline/link color would mislead.
             f.render_widget(
@@ -132,12 +112,10 @@ fn header_paragraph(detail: Option<&PrDetailResponse>, width: u16) -> Paragraph<
         + display_width(sep) * 3;
     let branch_full = format!("{} → {}", d.head_ref, d.base_ref);
     let avail = (width as usize).saturating_sub(fixed_w);
-    let branch = truncate_to_display(&branch_full, avail);
+    let branch = crate::tui::views::text::truncate_to_display_width(&branch_full, avail);
 
-    let mut segments: Vec<(String, Color)> = vec![
-        (state_seg, state_color),
-        (d.author.clone(), SUBTEXT0),
-    ];
+    let mut segments: Vec<(String, Color)> =
+        vec![(state_seg, state_color), (d.author.clone(), SUBTEXT0)];
     if !branch.is_empty() {
         segments.push((branch, SUBTEXT0));
     }
@@ -154,9 +132,9 @@ fn header_paragraph(detail: Option<&PrDetailResponse>, width: u16) -> Paragraph<
     Paragraph::new(Line::from(spans)).style(Style::default().bg(BASE))
 }
 
-/// Row of at-a-glance status chips (review decision, mergeability, CI) on the
-/// left and diff stat tiles on the right. Status chips come first so they
-/// survive width clipping — they answer "approved? conflicts? CI green?".
+/// Row of at-a-glance status chips (review decision, mergeability, CI) followed
+/// by compact diff/comment counts. Status chips come first so they survive
+/// width clipping — they answer "approved? conflicts? CI green?".
 fn render_status_stats_row(f: &mut Frame, area: Rect, detail: Option<&PrDetailResponse>) {
     if area.height == 0 {
         return;
@@ -168,7 +146,10 @@ fn render_status_stats_row(f: &mut Frame, area: Rect, detail: Option<&PrDetailRe
 
     let mut spans = status_chips(d);
     if !spans.is_empty() {
-        spans.push(Span::styled(" │ ", Style::default().fg(OVERLAY0).bg(SURFACE0)));
+        spans.push(Span::styled(
+            " │ ",
+            Style::default().fg(OVERLAY0).bg(SURFACE0),
+        ));
     }
     spans.extend(diff_stat_spans(d));
 
@@ -181,26 +162,26 @@ fn render_status_stats_row(f: &mut Frame, area: Rect, detail: Option<&PrDetailRe
 fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
     let mut chips: Vec<(String, Color)> = Vec::new();
 
-    let (review_text, review_color) = match d.review_decision.as_deref() {
-        Some("APPROVED") => ("approved", ADD),
-        Some("CHANGES_REQUESTED") => ("changes req", DEL),
-        Some("REVIEW_REQUIRED") => ("review req", MED),
-        _ => ("no review", OVERLAY0),
+    let (review_text, review_color) = match d.review_decision {
+        Some(ReviewDecision::Approved) => ("approved", ADD),
+        Some(ReviewDecision::ChangesRequested) => ("changes req", DEL),
+        Some(ReviewDecision::ReviewRequired) => ("review req", MED),
+        None => ("no review", OVERLAY0),
     };
     chips.push((review_text.to_string(), review_color));
 
-    match d.mergeable.as_str() {
-        "MERGEABLE" => chips.push(("mergeable".to_string(), ADD)),
-        "CONFLICTING" => chips.push(("conflicts".to_string(), DEL)),
-        _ => chips.push(("merge ?".to_string(), OVERLAY0)),
+    match d.mergeable {
+        MergeableState::Mergeable => chips.push(("mergeable".to_string(), ADD)),
+        MergeableState::Conflicting => chips.push(("conflicts".to_string(), DEL)),
+        MergeableState::Unknown => chips.push(("merge ?".to_string(), OVERLAY0)),
     }
 
-    let (checks_text, checks_color) = match d.check_status.as_str() {
-        "success" => ("checks ✓", ADD),
-        "failure" => ("checks ✗", DEL),
-        "pending" => ("checks …", MED),
-        "neutral" => ("checks ~", OVERLAY0),
-        _ => ("no checks", OVERLAY0),
+    let (checks_text, checks_color) = match d.check_status {
+        CheckStatus::Success => ("checks ✓", ADD),
+        CheckStatus::Failure => ("checks ✗", DEL),
+        CheckStatus::Pending => ("checks …", MED),
+        CheckStatus::Neutral => ("checks ~", OVERLAY0),
+        CheckStatus::None => ("no checks", OVERLAY0),
     };
     chips.push((checks_text.to_string(), checks_color));
 
@@ -220,59 +201,76 @@ fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
     spans
 }
 
+/// Compact diff/comment counts appended after the status chips. This data is
+/// otherwise duplicated in full elsewhere (file count in the Files blade,
+/// comment count in the Inbox's ✎ column), so it's kept terse here rather
+/// than given its own labeled row.
 fn diff_stat_spans(d: &PrDetailResponse) -> Vec<Span<'static>> {
     let added: u64 = d.files.iter().map(|f| f.additions).sum();
     let removed: u64 = d.files.iter().map(|f| f.deletions).sum();
     let files = d.files.len() as u64;
     let comments = d.review_threads.len() as u64
-        + d
-            .timeline
+        + d.timeline
             .iter()
-            .filter(|e| e.event_type == "comment")
+            .filter(|e| e.event_type == TimelineEventType::Comment)
             .count() as u64;
 
-    let tiles = [
-        (
-            format!("{} ADDED", ICON_DIFF_ADDED),
-            format!("+{}", added),
-            ADD,
-        ),
-        (
-            format!("{} REMOVED", ICON_DIFF_REMOVED),
+    let dot = Span::styled(" · ", Style::default().fg(OVERLAY0).bg(SURFACE0));
+    vec![
+        Span::styled(format!("+{}", added), Style::default().fg(ADD).bg(SURFACE0)),
+        Span::styled(" ", Style::default().bg(SURFACE0)),
+        Span::styled(
             format!("−{}", removed),
-            DEL,
+            Style::default().fg(DEL).bg(SURFACE0),
         ),
-        (format!("{} FILES", ICON_FILES), files.to_string(), HUNK),
-        (
-            format!("{} COMMENTS", ICON_COMMENT),
-            comments.to_string(),
-            OVERVIEW,
+        dot.clone(),
+        Span::styled(
+            format!("{} files", files),
+            Style::default().fg(MUTED).bg(SURFACE0),
         ),
-    ];
+        dot,
+        Span::styled(
+            format!("{} comments", comments),
+            Style::default().fg(MUTED).bg(SURFACE0),
+        ),
+    ]
+}
 
-    tiles
-        .iter()
-        .enumerate()
-        .flat_map(|(i, (label, value, color))| {
-            let mut s = vec![];
-            if i > 0 {
-                s.push(Span::styled("  ", Style::default().bg(SURFACE0)));
-            }
-            s.push(Span::styled(
-                label.clone(),
-                Style::default()
-                    .fg(*color)
-                    .bg(SURFACE0)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            s.push(Span::styled(" ", Style::default().bg(SURFACE0)));
-            s.push(Span::styled(
-                value.clone(),
-                Style::default().fg(TEXT).bg(SURFACE0),
-            ));
-            s
-        })
-        .collect()
+/// Number of Description content lines shown when collapsed (the default).
+/// The rest of the description is hidden behind the `d to expand` marker so a
+/// long markdown body doesn't push Checks/Last Activity off screen.
+const COLLAPSED_DESCRIPTION_LINES: usize = 4;
+
+/// Number of lines [`description_display_lines`] would render for a description
+/// of `total` lines. Shared with `ViewStateManager::prepare` so the Description
+/// scroll clamp matches the rows actually shown (a collapsed preview claims only
+/// the preview lines plus the expand marker, not the full body).
+pub fn description_display_line_count(total: usize, expanded: bool) -> usize {
+    if expanded || total <= COLLAPSED_DESCRIPTION_LINES {
+        total
+    } else {
+        COLLAPSED_DESCRIPTION_LINES + 1
+    }
+}
+
+/// Build the lines actually shown for the Description section: a short
+/// preview plus an expand hint when collapsed, or everything when expanded
+/// (or when the description is already short enough that collapsing it
+/// wouldn't hide anything).
+fn description_display_lines(lines: &[Line<'static>], expanded: bool) -> Vec<Line<'static>> {
+    if expanded || lines.len() <= COLLAPSED_DESCRIPTION_LINES {
+        return lines.to_vec();
+    }
+    let mut preview = lines[..COLLAPSED_DESCRIPTION_LINES].to_vec();
+    let more = lines.len() - COLLAPSED_DESCRIPTION_LINES;
+    preview.push(Line::from(Span::styled(
+        format!(
+            "… d to expand ({more} more line{})",
+            if more == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(MUTED),
+    )));
+    preview
 }
 
 /// Render the Overview body as stacked sections: Summary, Description, Checks,
@@ -293,9 +291,15 @@ fn render_body_rows(
     };
 
     let cache = &ctx.state.render_cache;
+    let description_expanded = view.overview_description_expanded;
+    let description_lines =
+        description_display_lines(&cache.overview_description, description_expanded);
+    // Feed the *displayed* line count (not the full description length) into
+    // the height split, so a collapsed description only claims the couple of
+    // rows it actually renders instead of ballooning to fit hidden content.
     let lens = [
         cache.overview_summary.len(),
-        cache.overview_description.len(),
+        description_lines.len(),
         cache.overview_checks.len(),
     ];
     let heights = overview_section_heights(area.height, lens, view.overview_focus);
@@ -304,22 +308,37 @@ fn render_body_rows(
     let mut y = area.y;
     let rect_for = |y: u16, h: u16| Rect::new(area.x, y, area.width, h);
 
+    let loading_summary = ctx.state.llm_detail_loading
+        && ctx
+            .state
+            .pr_detail
+            .as_ref()
+            .and_then(|d| d.llm_rich_summary.as_ref())
+            .is_none();
     render_section(
         f,
         rect_for(y, heights[0]),
-        "SUMMARY",
+        "Brunson Says...",
         &cache.overview_summary,
         view.overview_summary_scroll.offset,
         view.overview_focus == OverviewFocus::Summary,
+        loading_summary,
     );
     y = y.saturating_add(heights[0]);
     render_section(
         f,
         rect_for(y, heights[1]),
         "DESCRIPTION",
-        &cache.overview_description,
-        view.overview_description_scroll.offset,
+        &description_lines,
+        // Scrolling a preview doesn't make sense; only honor the scroll
+        // offset once the full description is showing.
+        if description_expanded {
+            view.overview_description_scroll.offset
+        } else {
+            0
+        },
         view.overview_focus == OverviewFocus::Description,
+        false,
     );
     y = y.saturating_add(heights[1]);
     render_section(
@@ -329,6 +348,7 @@ fn render_body_rows(
         &cache.overview_checks,
         view.overview_checks_scroll.offset,
         view.overview_focus == OverviewFocus::Checks,
+        false,
     );
     y = y.saturating_add(heights[2]);
     render_last_activity(
@@ -431,6 +451,7 @@ fn render_section(
     lines: &[Line<'static>],
     scroll: usize,
     focused: bool,
+    loading: bool,
 ) {
     if area.height == 0 {
         return;
@@ -441,10 +462,11 @@ fn render_section(
 
     let label_color = if focused { OVERVIEW } else { OVERLAY0 };
     let bar = if focused { "▌" } else { " " };
+    let sparkle = if loading { "✨ " } else { "" };
     let header = Paragraph::new(Line::from(vec![
         Span::styled(bar, Style::default().fg(OVERVIEW).bg(bg)),
         Span::styled(
-            label,
+            format!("{}{}", sparkle, label),
             Style::default()
                 .fg(label_color)
                 .bg(bg)
@@ -455,10 +477,26 @@ fn render_section(
     f.render_widget(header, Rect::new(area.x, area.y, area.width, 1));
 
     let content_height = area.height.saturating_sub(1);
-    if content_height == 0 || lines.is_empty() {
+    if content_height == 0 {
         return;
     }
     let content_area = Rect::new(area.x, area.y + 1, area.width, content_height);
+
+    if loading && lines.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                "Brunson is thinking about this PR...",
+                Style::default().fg(PENDING).bg(bg),
+            )]))
+            .style(Style::default().bg(bg)),
+            content_area,
+        );
+        return;
+    }
+
+    if lines.is_empty() {
+        return;
+    }
     ScrollViewport::new(lines, scroll)
         .style(Style::default().fg(TEXT).bg(bg))
         .scrollbar(true)
@@ -531,7 +569,10 @@ mod tests {
         // even though Summary is focused, because Summary doesn't need it.
         let h = overview_section_heights(30, [1, 50, 1], OverviewFocus::Summary);
         assert_eq!(h.iter().sum::<u16>(), 30);
-        assert!(h[1] > h[0], "long description should outgrow summary: {h:?}");
+        assert!(
+            h[1] > h[0],
+            "long description should outgrow summary: {h:?}"
+        );
     }
 
     #[test]
@@ -546,5 +587,34 @@ mod tests {
             let h = overview_section_heights(height, [10, 10, 10], OverviewFocus::Checks);
             assert_eq!(h.iter().sum::<u16>(), height, "height={height}");
         }
+    }
+
+    fn lines(n: usize) -> Vec<Line<'static>> {
+        (0..n).map(|i| Line::from(format!("line {i}"))).collect()
+    }
+
+    #[test]
+    fn collapsed_description_shows_preview_plus_marker() {
+        let full = lines(40);
+        let shown = description_display_lines(&full, false);
+        assert_eq!(shown.len(), COLLAPSED_DESCRIPTION_LINES + 1);
+        assert_eq!(shown[0].spans[0].content, "line 0");
+        assert!(shown.last().unwrap().spans[0]
+            .content
+            .contains("36 more lines"));
+    }
+
+    #[test]
+    fn expanded_description_shows_everything() {
+        let full = lines(40);
+        let shown = description_display_lines(&full, true);
+        assert_eq!(shown.len(), 40);
+    }
+
+    #[test]
+    fn short_description_is_not_truncated_even_when_collapsed() {
+        let full = lines(COLLAPSED_DESCRIPTION_LINES);
+        let shown = description_display_lines(&full, false);
+        assert_eq!(shown.len(), COLLAPSED_DESCRIPTION_LINES);
     }
 }

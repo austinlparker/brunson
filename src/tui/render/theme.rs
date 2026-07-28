@@ -1,5 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::github::types::PrGroup;
+
 // ── Catppuccin Mocha palette ────────────────────────────────────────────────
 
 // Base/grayscale
@@ -153,16 +155,6 @@ impl Blade {
         }
     }
 
-    pub const fn icon(self) -> &'static str {
-        match self {
-            Blade::Inbox => ICON_INBOX,
-            Blade::Overview => ICON_OVERVIEW,
-            Blade::Activity => ICON_ACTIVITY,
-            Blade::Files => ICON_FILES,
-            Blade::Diff => ICON_DIFF,
-        }
-    }
-
     pub const fn count() -> usize {
         5
     }
@@ -213,12 +205,14 @@ impl Theme {
     }
 }
 
-/// Map a PR group string to a display color.
-pub fn state_color(group: &str) -> Color {
+/// Map a PR group to a display color.
+pub fn state_color(group: PrGroup) -> Color {
     match group {
-        "open" | "review_needed" | "review_update" | "review_done" => OPEN,
-        "draft" => DRAFT,
-        "authored_action_needed" | "authored_ready_to_merge" | "authored_waiting" => OPEN,
-        _ => REVIEW_REQUESTED,
+        PrGroup::ReviewNeeded | PrGroup::ReviewUpdate | PrGroup::ReviewDone => OPEN,
+        PrGroup::Draft => DRAFT,
+        PrGroup::AuthoredActionNeeded | PrGroup::AuthoredReadyToMerge | PrGroup::AuthoredWaiting => {
+            OPEN
+        }
+        PrGroup::Other => REVIEW_REQUESTED,
     }
 }

@@ -188,7 +188,7 @@ fn file_line(
     ];
 
     // Path (flex, truncated to the path column width)
-    let path = truncate_width(&file.path, cols.path_width as usize);
+    let path = crate::tui::views::text::truncate_to_display_width(&file.path, cols.path_width as usize);
     spans.push(pad_span(
         &path,
         cols.path_width,
@@ -245,32 +245,6 @@ fn pad_span(text: &str, width: u16, style: Style) -> Span<'static> {
     Span::styled(content, style)
 }
 
-fn truncate_width(s: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    use unicode_width::UnicodeWidthStr;
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-    use unicode_width::UnicodeWidthChar;
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w + 1 > max_width {
-            break;
-        }
-        used += w;
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,16 +258,6 @@ mod tests {
         let narrow = FileColumnLayout::compute(28);
         assert!(narrow.path_width >= 8);
         assert!(narrow.comments_width.is_none());
-    }
-
-    #[test]
-    fn truncate_width_adds_ellipsis_and_respects_display_width() {
-        use unicode_width::UnicodeWidthStr;
-        let s = truncate_width("src/very/long/path/to/file.rs", 10);
-        assert!(UnicodeWidthStr::width(s.as_str()) <= 10);
-        assert!(s.ends_with('…'));
-        assert_eq!(truncate_width("hi", 10), "hi");
-        assert_eq!(truncate_width("abc", 0), "");
     }
 
     #[test]

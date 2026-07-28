@@ -99,6 +99,8 @@ diff_style = "unified"       # or "side-by-side"
 show_line_numbers = true
 ```
 
+Explicit `team_review_requests` entries should use GitHub team slugs (`org/team-slug`). Brunson keeps PRs found only through those team targets only while the PR still requests that team and the authenticated viewer is still a current member of that team; if GitHub cannot answer the membership check, the refresh fails safely and preserves the existing PR list instead of dropping data.
+
 The `o` key opens the selected PR in a browser.
 
 
@@ -121,12 +123,9 @@ The TUI uses a five-blade horizontal dashboard (Inbox → Overview → Activity 
 | `1`–`5` | Jump to a blade directly |
 | `j`/`↓` / `k`/`↑` | Scroll / move selection within the active blade |
 | `Space` | Toggle Inbox group collapse |
-| `a` | Approve stub |
-| `r` | Request changes stub |
-| `m` | Merge stub |
+| `/` | Filter inbox |
 | `o` | Open selected PR in browser |
 | `R` | Refresh from GitHub |
-| `/` | Search stub |
 | `?` | Show help |
 | `q` | Quit |
 

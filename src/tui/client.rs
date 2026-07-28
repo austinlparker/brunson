@@ -59,8 +59,36 @@ impl DaemonClient {
         Ok(resp.json().await?)
     }
 
+    async fn post_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.client.post(&url).json(body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {} failed ({}): {}", path, status, body);
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn get_health(&self) -> Result<HealthResponse> {
         self.get("/health").await
+    }
+
+    /// Ask a running daemon to shut down gracefully (no response body).
+    /// Used to retire a stale daemon before spawning a fresh one.
+    pub async fn request_shutdown(&self) -> Result<()> {
+        let url = format!("{}/shutdown", self.base_url);
+        let resp = self.client.post(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST /shutdown failed ({}): {}", status, body);
+        }
+        Ok(())
     }
 
     /// Quick health check with short timeout — used for daemon detection.
@@ -95,9 +123,30 @@ impl DaemonClient {
         self.post("/prs/refresh").await
     }
 
-    #[allow(dead_code)]
+    /// Classify a PR. This awaits an LLM call inline on the daemon side, and
+    /// a slow local model routinely runs past the client's default 30s
+    /// timeout even though the daemon completes (and caches the result)
+    /// successfully — so this request gets a much longer deadline than the
+    /// rest of the API.
     pub async fn classify(&self, id: &str) -> Result<ClassifyResponse> {
-        self.post(&format!("/prs/{}/classify", id)).await
+        let path = format!("/prs/{}/classify", id);
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("POST {} failed ({}): {}", path, status, body);
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn mark_seen(&self, id: &str) -> Result<serde_json::Value> {
+        self.post(&format!("/prs/{}/seen", id)).await
     }
 
     pub async fn get_setup_status(&self) -> Result<SetupStatusResponse> {
@@ -106,6 +155,27 @@ impl DaemonClient {
 
     pub async fn get_config(&self) -> Result<crate::config::Config> {
         self.get("/config").await
+    }
+
+    /// Fetch the orgs/teams the authenticated viewer belongs to, for the
+    /// setup wizard's target picker.
+    pub async fn get_org_memberships(&self) -> Result<MembershipsResponse> {
+        self.get("/setup/memberships").await
+    }
+
+    /// Validate a candidate config without writing it (server-side
+    /// `Config::validate`, same rules the daemon enforces on reload).
+    pub async fn validate_config(&self, config: &crate::config::Config) -> Result<ConfigValidateResponse> {
+        self.post_json("/config/validate", config).await
+    }
+
+    /// Actually run a candidate config's search queries and return a live,
+    /// deduplicated match count — the wizard's "here's what you'll see".
+    pub async fn preview_config_counts(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<ConfigPreviewCountsResponse> {
+        self.post_json("/config/preview_counts", config).await
     }
 
     pub async fn reload_config(&self) -> Result<()> {

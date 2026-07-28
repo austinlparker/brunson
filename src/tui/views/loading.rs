@@ -4,7 +4,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::app::StartupPhase;
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::theme::{INBOX, MANTLE, OVERLAY0, SUBTEXT0, TEXT};
 
@@ -23,8 +22,10 @@ pub fn render_loading(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     f.render_widget(block, popup);
 
     let spinner = spinner(ctx.state.ui_tick);
-    let phase = phase_label(ctx.state.startup_phase);
     let bar = progress_bar(ctx.state.ui_tick, inner.width.saturating_sub(4) as usize);
+    // There's no discrete "phase" left to report honestly here (daemon
+    // start, setup check, and initial fetches all happen off-loop before a
+    // single `StartupLoaded` event lands) — just show that we're working.
     let lines = vec![
         Line::from(""),
         Line::from(vec![
@@ -34,7 +35,7 @@ pub fn render_loading(f: &mut Frame, area: Rect, ctx: &RenderContext) {
             ),
             Span::styled(" ", Style::default().fg(TEXT)),
             Span::styled(
-                phase,
+                "Starting...",
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -67,20 +68,11 @@ fn spinner(tick: u64) -> &'static str {
     }
 }
 
-fn phase_label(phase: StartupPhase) -> &'static str {
-    match phase {
-        StartupPhase::StartingDaemon => "Starting daemon",
-        StartupPhase::CheckingSetup => "Checking setup",
-        StartupPhase::LoadingConfig => "Loading config",
-        StartupPhase::LoadingPrs => "Loading pull requests",
-        StartupPhase::Ready => "Ready",
-    }
-}
-
 fn progress_bar(tick: u64, width: usize) -> String {
     let width = width.clamp(12, 44);
     let window = 7usize.min(width);
-    let pos = (tick as usize) % width;
+    // Slow the bar down to match the old 1s tick visual speed (roughly).
+    let pos = ((tick / 6) as usize) % width;
     let mut chars = vec!['-'; width];
     for i in 0..window {
         chars[(pos + i) % width] = '#';
@@ -100,6 +92,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::tui::app::StartupPhase;
     use crate::tui::client::DaemonClient;
     use crate::tui::render::component::RenderContext;
     use crate::tui::render::theme::Theme;
@@ -113,7 +106,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state =
             crate::tui::app::AppState::new(Config::default(), DaemonClient::new(17890).unwrap());
-        state.startup_phase = StartupPhase::LoadingPrs;
+        state.startup_phase = StartupPhase::Starting;
         state.ui_tick = 2;
         let view = ViewState::default();
         let theme = Theme;

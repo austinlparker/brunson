@@ -1,48 +1,54 @@
 use chrono::{DateTime, Local, Utc};
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::theme::{
-    BASE, FAIL, ICON_PR, ICON_SYNC, OVERLAY0, PENDING, SUBTEXT0, SURFACE0, TEXT,
+    Blade, BASE, FAIL, ICON_PR, OVERLAY0, PENDING, SUBTEXT0, SURFACE0, TEXT,
 };
 
-/// Render the statusline just above the keybar.
-/// Shows the current PR title/number, a staleness indicator, and blade name:
-/// `❯ #id title · <blade> · <sync> 2m █`.
-pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
-    let state = ctx.state;
-    let accent = ctx.view.active_blade.accent();
+/// Render the top tab line: one entry per blade on the left, a right-aligned
+/// refresh spinner, data-age indicator, and clock. The active tab is bold in
+/// its blade accent; inactive tabs are dim, prefixed with their `1-5` jump key.
+pub fn render_tab_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
+    let active = ctx.view.active_blade;
 
-    let title = if let Some(detail) = state.pr_detail.as_ref() {
-        format!("{} #{} {}", ICON_PR, detail.number, detail.title)
-    } else if let Some(id) = state.selected_pr_id.as_ref() {
-        format!("{} {}", ICON_PR, id.replace('~', "/"))
-    } else {
-        crate::daemon::SERVICE_NAME.to_string()
-    };
+    let mut spans = vec![Span::styled("  ", Style::default().bg(BASE))];
+    let mut used = 2usize;
+    for i in 0..Blade::count() {
+        let blade = Blade::from_index(i);
+        if i > 0 {
+            spans.push(Span::styled("   ", Style::default().bg(BASE)));
+            used += 3;
+        }
+        if blade == active {
+            let name = blade.name();
+            used += name.chars().count();
+            spans.push(Span::styled(
+                name,
+                Style::default()
+                    .fg(blade.accent())
+                    .bg(BASE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            // The leading digit doubles as the `1-5` jump-key hint.
+            let label = format!("{} {}", i + 1, blade.name());
+            used += label.chars().count();
+            spans.push(Span::styled(label, Style::default().fg(OVERLAY0).bg(BASE)));
+        }
+    }
 
-    let cursor = "█";
-    let blade_name = ctx.view.active_blade.name();
-    let (right_spans, right_width) = status_right_spans(state, accent, blade_name);
-    // Account for "❯ " prefix, the right-hand suffix, a space, and the cursor.
-    let overhead = 2 + right_width + 1 + 1;
-    let max_title_width = area.width.saturating_sub(overhead as u16).max(1) as usize;
-    let display_title = truncate_to_char_width(&title, max_title_width);
-
-    let mut spans = vec![
-        Span::styled("❯ ", Style::default().fg(TEXT).add_modifier(Modifier::DIM)),
-        Span::styled(
-            display_title,
-            Style::default().fg(TEXT).add_modifier(Modifier::DIM),
-        ),
-    ];
-    spans.extend(right_spans);
-    spans.push(Span::styled(" ", Style::default()));
-    spans.push(Span::styled(cursor, Style::default().fg(accent)));
+    let (meta_spans, meta_width) = tab_meta_spans(ctx.state);
+    let gap = area
+        .width
+        .saturating_sub((used + meta_width) as u16)
+        .max(1) as usize;
+    spans.push(Span::styled(" ".repeat(gap), Style::default().bg(BASE)));
+    spans.extend(meta_spans);
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(BASE)),
@@ -50,22 +56,11 @@ pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     );
 }
 
-/// Build the right-hand portion of the statusline (blade name + sync/age meta).
-/// Returns the spans and the character width they consume.
-fn status_right_spans(
-    state: &crate::tui::app::AppState,
-    accent: ratatui::style::Color,
-    blade_name: &'static str,
-) -> (Vec<Span<'static>>, usize) {
+/// Build the right-hand meta for the tab line (refresh spinner + data age +
+/// clock). Returns the spans and the character width they consume.
+fn tab_meta_spans(state: &crate::tui::app::AppState) -> (Vec<Span<'static>>, usize) {
     let mut spans = Vec::new();
     let mut width = 0usize;
-
-    let blade_suffix = format!(" · {}", blade_name);
-    spans.push(Span::styled(
-        blade_suffix.clone(),
-        Style::default().fg(accent),
-    ));
-    width += blade_suffix.chars().count();
 
     let refresh_active = state
         .health
@@ -86,45 +81,105 @@ fn status_right_spans(
         .and_then(parse_timestamp)
         .map(|dt| Utc::now().signed_duration_since(dt));
     let age_label = age.map(format_stale_age).unwrap_or_else(|| "—".to_string());
-    let age_color = age
-        .map(|d| {
-            let secs = d.num_seconds();
-            if secs < 300 {
-                SUBTEXT0
-            } else if secs < 900 {
-                PENDING
-            } else {
-                FAIL
-            }
-        })
-        .unwrap_or(OVERLAY0);
-
-    let sep = " · ";
-    spans.push(Span::styled(
-        sep.to_string(),
-        Style::default().fg(SUBTEXT0).add_modifier(Modifier::DIM),
-    ));
-    width += sep.chars().count();
+    let age_color = stale_age_color(age);
 
     if refresh_active {
+        let spinner = refresh_spinner(state.ui_tick);
         spans.push(Span::styled(
-            ICON_SYNC.to_string(),
-            Style::default().fg(PENDING).add_modifier(Modifier::BOLD),
+            spinner.to_string(),
+            Style::default()
+                .fg(PENDING)
+                .bg(BASE)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {}", age_label),
-            Style::default().fg(age_color).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(age_color)
+                .bg(BASE)
+                .add_modifier(Modifier::DIM),
         ));
-        width += ICON_SYNC.chars().count() + 1 + age_label.chars().count();
+        width += spinner.chars().count() + 1 + age_label.chars().count();
     } else {
         spans.push(Span::styled(
             age_label.clone(),
-            Style::default().fg(age_color).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(age_color)
+                .bg(BASE)
+                .add_modifier(Modifier::DIM),
         ));
         width += age_label.chars().count();
     }
 
+    let time_block = format!("  {} ", now_time());
+    width += time_block.chars().count();
+    spans.push(Span::styled(
+        time_block,
+        Style::default()
+            .fg(OVERLAY0)
+            .bg(BASE)
+            .add_modifier(Modifier::DIM),
+    ));
+
     (spans, width)
+}
+
+/// Escalate the data-age color from fresh (<5m) through stale (<15m) to old.
+fn stale_age_color(age: Option<chrono::Duration>) -> Color {
+    age.map(|d| {
+        let secs = d.num_seconds();
+        if secs < 300 {
+            SUBTEXT0
+        } else if secs < 900 {
+            PENDING
+        } else {
+            FAIL
+        }
+    })
+    .unwrap_or(OVERLAY0)
+}
+
+/// Render the statusline just above the keybar: `❯ #<number> <title> · <blade>`.
+/// The number and title come from the loaded detail when available, and
+/// otherwise from the selected summary in the list, so the grammar stays stable
+/// while the detail fetch is in flight.
+pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
+    let state = ctx.state;
+    let accent = ctx.view.active_blade.accent();
+
+    let title = if let Some(detail) = state.pr_detail.as_ref() {
+        format!("{} #{} {}", ICON_PR, detail.number, detail.title)
+    } else if let Some(summary) = selected_summary(state) {
+        format!("{} #{} {}", ICON_PR, summary.number, summary.title)
+    } else {
+        crate::daemon::SERVICE_NAME.to_string()
+    };
+
+    let blade_suffix = format!(" · {}", ctx.view.active_blade.name());
+    // Account for the "❯ " prefix, the blade suffix, and a trailing space.
+    let overhead = 2 + blade_suffix.chars().count() + 1;
+    let max_title_width = area.width.saturating_sub(overhead as u16).max(1) as usize;
+    let display_title = crate::tui::views::text::truncate_to_display_width(&title, max_title_width);
+
+    let spans = vec![
+        Span::styled("❯ ", Style::default().fg(TEXT).add_modifier(Modifier::DIM)),
+        Span::styled(
+            display_title,
+            Style::default().fg(TEXT).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(blade_suffix, Style::default().fg(accent)),
+    ];
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BASE)),
+        area,
+    );
+}
+
+/// Find the currently selected PR in the list snapshot the inbox renders from.
+fn selected_summary(state: &crate::tui::app::AppState) -> Option<&crate::api::PrSummary> {
+    let id = state.selected_pr_id.as_ref()?;
+    state.prs.groups.values().flatten().find(|p| &p.id == id)
 }
 
 /// Parse an RFC 3339 timestamp, returning `None` on failure.
@@ -148,85 +203,52 @@ fn format_stale_age(d: chrono::Duration) -> String {
     }
 }
 
-fn truncate_to_char_width(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        s.to_string()
-    } else if width <= 3 {
-        s.chars().take(width).collect()
-    } else {
-        format!(
-            "{}…",
-            s.chars().take(width.saturating_sub(1)).collect::<String>()
-        )
-    }
+/// Return a single-character spinner frame for the current animation tick.
+fn refresh_spinner(tick: u64) -> &'static str {
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    FRAMES[(tick as usize) % FRAMES.len()]
 }
 
-/// Render the persistent keybar at the bottom of the screen.
+/// Render the persistent keybar at the bottom of the screen. The bindings are
+/// contextual: config-specific while the config overlay is open, otherwise
+/// per-blade for the active blade.
 pub fn render_keybar(f: &mut Frame, area: Rect, ctx: &RenderContext) {
-    let state = ctx.state;
     let accent = ctx.view.active_blade.accent();
 
-    let keys = [
-        ("←/→", "blade"),
-        ("1-5", "jump"),
-        ("↑↓/jk", "scroll"),
-        ("⏎", "drill"),
-        ("a/r/m", "act"),
-        ("o", "open"),
-        ("c", "config"),
-        ("R", "refresh"),
-        ("/", "search"),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
+    let keys: &[(&str, &str)] = if ctx.state.show_config_view {
+        &[
+            ("j/k", "scroll"),
+            ("R", "reload"),
+            ("c/esc", "close"),
+            ("q", "quit"),
+        ]
+    } else {
+        blade_keys(ctx.view.active_blade)
+    };
 
-    let mut spans = vec![];
-    let mut used_width = 0usize;
+    let mut spans = Vec::new();
     for (i, (key, action)) in keys.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(SURFACE0)));
-            used_width += 2;
+            spans.push(Span::styled("  ", Style::default().fg(SURFACE0).bg(BASE)));
         }
         spans.push(Span::styled(
             *key,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", action),
-            Style::default().fg(SUBTEXT0).add_modifier(Modifier::DIM),
-        ));
-        used_width += key.chars().count() + 1 + action.chars().count();
-    }
-
-    if state.loading {
-        spans.push(Span::styled("  ", Style::default().fg(SURFACE0).bg(BASE)));
-        spans.push(Span::styled(
-            "refresh…",
             Style::default()
-                .fg(PENDING)
+                .fg(accent)
                 .bg(BASE)
                 .add_modifier(Modifier::BOLD),
         ));
-        used_width += 2 + "refresh…".chars().count();
+        spans.push(Span::styled(
+            format!(" {}", action),
+            Style::default()
+                .fg(SUBTEXT0)
+                .bg(BASE)
+                .add_modifier(Modifier::DIM),
+        ));
     }
 
     // NOTE: error messages are rendered as a centered InlineToast overlay over
     // the body by the render loop; the keybar always shows the binding list.
-
-    // Push the current time to the right edge.
-    let time = now_time();
-    let time_block = format!(" {} ", time);
-    let gap = area
-        .width
-        .saturating_sub((used_width + time_block.chars().count()) as u16)
-        .max(1) as usize;
-    spans.push(Span::styled(" ".repeat(gap), Style::default()));
-    spans.push(Span::styled(
-        time_block,
-        Style::default().fg(OVERLAY0).add_modifier(Modifier::DIM),
-    ));
-
     f.render_widget(
         Paragraph::new(Line::from(spans))
             .style(Style::default().bg(BASE))
@@ -235,6 +257,91 @@ pub fn render_keybar(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     );
 }
 
+/// Blade-specific key hints. Some bindings (g/G outside diff, `r` refresh, `d`
+/// description) are documented ahead of the handlers that implement them.
+fn blade_keys(blade: Blade) -> &'static [(&'static str, &'static str)] {
+    match blade {
+        Blade::Inbox => &[
+            ("j/k", "move"),
+            ("g/G", "top/bot"),
+            ("space", "fold"),
+            ("⏎", "open"),
+            ("/", "filter"),
+            ("o", "browser"),
+            ("r", "refresh"),
+            ("c", "config"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Blade::Overview => &[
+            ("j/k", "scroll"),
+            ("tab", "section"),
+            ("d", "description"),
+            ("←/→", "blade"),
+            ("o", "browser"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Blade::Activity => &[
+            ("j/k", "scroll"),
+            ("g/G", "top/bot"),
+            ("←/→", "blade"),
+            ("o", "browser"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Blade::Files => &[
+            ("j/k", "move"),
+            ("⏎", "diff"),
+            ("←/→", "blade"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Blade::Diff => &[
+            ("j/k", "scroll"),
+            ("g/G", "top/bot"),
+            ("n", "numbers"),
+            ("tab", "file"),
+            ("^d/^u", "page"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+    }
+}
+
 fn now_time() -> String {
     Local::now().format("%H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_spinner_cycles_through_frames() {
+        let first = refresh_spinner(0);
+        let second = refresh_spinner(1);
+        let wrap = refresh_spinner(10);
+        assert!(!first.is_empty());
+        assert_ne!(first, second);
+        assert_eq!(first, wrap);
+    }
+
+    #[test]
+    fn stale_age_color_escalates_with_age() {
+        use chrono::Duration;
+        assert_eq!(stale_age_color(None), OVERLAY0);
+        assert_eq!(stale_age_color(Some(Duration::seconds(10))), SUBTEXT0);
+        assert_eq!(stale_age_color(Some(Duration::seconds(299))), SUBTEXT0);
+        assert_eq!(stale_age_color(Some(Duration::seconds(300))), PENDING);
+        assert_eq!(stale_age_color(Some(Duration::seconds(899))), PENDING);
+        assert_eq!(stale_age_color(Some(Duration::seconds(900))), FAIL);
+    }
+
+    #[test]
+    fn blade_keys_cover_every_blade() {
+        for i in 0..Blade::count() {
+            assert!(!blade_keys(Blade::from_index(i)).is_empty());
+        }
+    }
 }

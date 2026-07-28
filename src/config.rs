@@ -191,6 +191,30 @@ impl Config {
         Ok(config)
     }
 
+    /// Atomically write this config to `path` (temp file + rename), so a
+    /// crash or concurrent read never observes a half-written file.
+    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create config dir {}", parent.display())
+                })?;
+            }
+        }
+        let temp_path = path.with_extension("toml.tmp");
+        let text = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        std::fs::write(&temp_path, text)
+            .with_context(|| format!("Failed to write temp config to {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to move {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     pub fn resolve_llm_defaults(&mut self) {
         if self.llm.provider.is_empty() {
             self.llm.provider = default_llm_provider();

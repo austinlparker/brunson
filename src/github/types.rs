@@ -150,6 +150,22 @@ pub enum Priority {
     Low,
 }
 
+/// Richer LLM-generated orientation for a PR: what changed since the user last
+/// looked at it, and what they should do next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRichSummary {
+    /// One-line tl;dr shown in the inbox and at the top of the Overview.
+    pub one_line: String,
+    /// What has changed since the user's `last_seen_at` timestamp.
+    pub catch_up: String,
+    /// Concrete next action the user should take.
+    pub next_steps: String,
+    /// When this summary was generated.
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    /// Prompt/version identifier used to invalidate stale cached summaries.
+    pub prompt_version: u32,
+}
+
 /// A single review thread (group of inline comments).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewThread {
@@ -243,6 +259,11 @@ pub struct PullRequest {
     pub body: String,
     pub url: String,
     pub author: String,
+    /// Whether the author is a GitHub App/bot (GraphQL actor `__typename == "Bot"`,
+    /// e.g. dependabot). Defaults to false so store JSON written before this field
+    /// existed still deserializes.
+    #[serde(default)]
+    pub author_is_bot: bool,
     pub owner: String,
     pub repo: String,
     pub is_draft: bool,
@@ -251,7 +272,11 @@ pub struct PullRequest {
     pub base_ref: String,
     pub mergeable: MergeableState,
     pub review_decision: Option<ReviewDecision>,
+    /// Direct user review requests, stored as GitHub user logins.
     pub review_requests: Vec<String>,
+    /// Team review requests, normalized as `org/team-slug`.
+    #[serde(default)]
+    pub team_review_requests: Vec<String>,
     pub viewer_latest_review: Option<String>,
     pub latest_reviews: Vec<LatestReview>,
     pub check_status: CheckStatus,
@@ -268,6 +293,12 @@ pub struct PullRequest {
     pub llm_priority: Option<Priority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_summary: Option<String>,
+    /// Richer LLM-generated catch-up / next-steps summary, generated on demand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_rich_summary: Option<LlmRichSummary>,
+    /// Last time the user focused this PR in the TUI. Used to scope the catch-up text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl PullRequest {
@@ -299,6 +330,20 @@ pub struct SearchResult {
     pub updated_at: String,
 }
 
+/// An org the viewer belongs to, and the teams within it the viewer is a
+/// member of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgMembership {
+    pub login: String,
+    pub teams: Vec<TeamMembership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamMembership {
+    pub slug: String,
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +372,7 @@ mod tests {
             body: String::new(),
             url: String::new(),
             author: "user".into(),
+            author_is_bot: false,
             owner: "org".into(),
             repo: "repo".into(),
             is_draft: false,
@@ -336,6 +382,7 @@ mod tests {
             mergeable: MergeableState::Unknown,
             review_decision: None,
             review_requests: vec![],
+            team_review_requests: vec![],
             viewer_latest_review: None,
             latest_reviews: vec![],
             check_status: CheckStatus::None,
@@ -346,6 +393,8 @@ mod tests {
             comments: 0,
             llm_priority: None,
             llm_summary: None,
+            llm_rich_summary: None,
+            last_seen_at: None,
         };
         assert_eq!(pr.slug(), "org~repo~42");
     }

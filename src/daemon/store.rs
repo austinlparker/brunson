@@ -46,6 +46,9 @@ impl PrStore {
                 if existing.updated_at != pr.updated_at {
                     self.cached_diffs.remove(&existing.slug());
                     self.cached_diffs.remove(&pr.slug());
+                    // Rich catch-up/next-steps summaries are scoped to a specific
+                    // point in time; invalidate them when the PR changes.
+                    pr.llm_rich_summary = None;
                     changed.push(pr.clone());
                 }
             } else {
@@ -76,6 +79,13 @@ impl PrStore {
         changed
     }
 
+    /// Hydrate LLM classifications and `last_seen_at` from the on-disk cache.
+    pub fn hydrate_llm_cache(&mut self, cache: &crate::llm::LlmClassificationCache) {
+        for pr in self.prs.values_mut() {
+            cache.apply_to_pr(pr);
+        }
+    }
+
     /// Group all PRs into actionable state groups.
     /// Each PR appears in exactly one group (highest priority match).
     pub fn group_prs(&self) -> HashMap<PrGroup, Vec<PullRequest>> {
@@ -86,9 +96,11 @@ impl PrStore {
             groups.entry(group).or_default().push(pr.clone());
         }
 
-        // Sort each group by updated_at descending
+        // Sort each group by updated_at descending, breaking ties by slug so
+        // PRs with identical timestamps don't reorder between polls due to
+        // HashMap iteration order.
         for prs in groups.values_mut() {
-            prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.slug().cmp(&b.slug())));
         }
 
         groups
@@ -302,6 +314,7 @@ mod tests {
             body: String::new(),
             url: String::new(),
             author: author.into(),
+            author_is_bot: false,
             owner: "org".into(),
             repo: "repo".into(),
             is_draft,
@@ -311,6 +324,7 @@ mod tests {
             mergeable,
             review_decision,
             review_requests,
+            team_review_requests: vec![],
             viewer_latest_review: viewer_latest_review.map(String::from),
             latest_reviews: vec![],
             check_status,
@@ -321,6 +335,8 @@ mod tests {
             comments: 0,
             llm_priority: None,
             llm_summary: None,
+            llm_rich_summary: None,
+            last_seen_at: None,
         }
     }
 
@@ -708,6 +724,56 @@ mod tests {
         let ready = groups.get(&PrGroup::AuthoredReadyToMerge).unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].number, 2);
+    }
+
+    #[test]
+    fn test_group_prs_ties_broken_by_slug() {
+        // Two drafts with identical `updated_at` must always sort in slug
+        // order, regardless of insertion order (HashMap iteration order is
+        // otherwise nondeterministic).
+        let same_time = "2024-01-01T00:00:00Z";
+        let pr_a = make_pr(
+            "a",
+            1,
+            "other",
+            true,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            same_time,
+        );
+        let pr_b = make_pr(
+            "b",
+            2,
+            "other",
+            true,
+            CheckStatus::None,
+            vec![],
+            None,
+            None,
+            MergeableState::Unknown,
+            same_time,
+        );
+
+        let mut store_forward = PrStore::new("me".into());
+        store_forward.update_prs(vec![pr_a.clone(), pr_b.clone()]);
+        let groups_forward = store_forward.group_prs();
+        let draft_forward = groups_forward.get(&PrGroup::Draft).unwrap();
+        assert_eq!(
+            draft_forward.iter().map(|p| p.slug()).collect::<Vec<_>>(),
+            vec![pr_a.slug(), pr_b.slug()]
+        );
+
+        let mut store_reverse = PrStore::new("me".into());
+        store_reverse.update_prs(vec![pr_b.clone(), pr_a.clone()]);
+        let groups_reverse = store_reverse.group_prs();
+        let draft_reverse = groups_reverse.get(&PrGroup::Draft).unwrap();
+        assert_eq!(
+            draft_reverse.iter().map(|p| p.slug()).collect::<Vec<_>>(),
+            vec![pr_a.slug(), pr_b.slug()]
+        );
     }
 
     #[test]

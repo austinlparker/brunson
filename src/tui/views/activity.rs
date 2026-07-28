@@ -3,6 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
+use crate::github::types::TimelineEventType;
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::layout::fill;
 use crate::tui::render::primitives::ScrollViewport;
@@ -32,21 +33,21 @@ pub fn render_activity(f: &mut Frame, area: Rect, ctx: &RenderContext) {
         .render(f, area);
 }
 
-pub(crate) fn timeline_verb(event_type: &str) -> (&'static str, Color) {
+pub(crate) fn timeline_verb(event_type: &TimelineEventType) -> (&'static str, Color) {
     match event_type {
-        "opened" => ("opened", ADD),
-        "comment" => ("commented", ACTIVITY),
-        "review" => ("reviewed", PASS),
-        "commit" => ("pushed", OVERVIEW),
-        "force_push" => ("force-pushed", FAIL),
-        "ready_for_review" => ("readied", ADD),
-        "review_requested" => ("requested", DRAFT),
-        "merged" => ("merged", ADD),
-        "closed" => ("closed", FAIL),
-        "reopened" => ("reopened", ADD),
-        "approved" => ("approved", PASS),
-        "changes_requested" => ("changes-requested", FAIL),
-        _ => ("acted", MUTED),
+        TimelineEventType::Comment => ("commented", ACTIVITY),
+        TimelineEventType::Review => ("reviewed", PASS),
+        TimelineEventType::Commit => ("pushed", OVERVIEW),
+        TimelineEventType::ForcePush => ("force-pushed", FAIL),
+        TimelineEventType::ReadyForReview => ("readied", ADD),
+        TimelineEventType::ReviewRequested => ("requested", DRAFT),
+        TimelineEventType::Merged => ("merged", ADD),
+        TimelineEventType::Closed => ("closed", FAIL),
+        TimelineEventType::Reopened => ("reopened", ADD),
+        // No daemon code emits `opened`/`approved`/`changes_requested` as a
+        // timeline event type (those are represented via `Review`/other
+        // events), so `Other` is the only remaining case.
+        TimelineEventType::Other => ("acted", MUTED),
     }
 }
 

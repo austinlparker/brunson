@@ -21,18 +21,30 @@ use crate::daemon::store::{PrStore, SharedStore};
 use crate::github::auth::resolve_host;
 use crate::github::client::GitHubClient;
 use crate::llm::classifier::Classifier;
+use crate::llm::LlmClassificationCache;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
 
-/// Resolve the current GitHub client and verified viewer login as one invariant.
+/// Resolve the current GitHub client. A missing/invalid token or a client
+/// construction failure is a real error (there's nothing usable to return),
+/// but a failure to resolve the viewer's login is not: it's usually a
+/// transient GraphQL hiccup (rate limit, timeout, brief network blip), and
+/// polling/search use `@me` qualifiers rather than the resolved login, so an
+/// otherwise-working client shouldn't be discarded over it.
 pub async fn resolve_github_client_and_user(
     auth: &dyn SetupAuth,
 ) -> Result<(GitHubClient, String)> {
     let token = auth.resolve_token()?;
     let host = resolve_host();
     let client = GitHubClient::new(token.clone(), Some(host.clone()))?;
-    let login = auth.viewer_login(&token, &host).await?;
+    let login = match auth.viewer_login(&token, &host).await {
+        Ok(login) => login,
+        Err(e) => {
+            warn!("Failed to resolve viewer login (client still usable): {}", e);
+            "unknown".to_string()
+        }
+    };
     Ok((client, login))
 }
 
@@ -95,6 +107,14 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
     // Create shared store
     let store: SharedStore = Arc::new(tokio::sync::RwLock::new(PrStore::new(current_user)));
 
+    // Load persisted LLM classification cache.
+    let llm_cache = Arc::new(tokio::sync::RwLock::new(
+        LlmClassificationCache::load().unwrap_or_else(|e| {
+            warn!("Failed to load LLM classification cache: {}. Starting fresh.", e);
+            LlmClassificationCache::default()
+        }),
+    ));
+
     // Create poll state (for refresh signal)
     let refresh_notify = Arc::new(Notify::new());
     let poll_state = Arc::new(PollState::new(refresh_notify.clone()));
@@ -102,6 +122,11 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
     // Create the config watch channel so the poller and handlers always see
     // the latest configuration without requiring a daemon restart.
     let (config_tx, config_rx) = watch::channel(config.clone());
+
+    // Cancellation token for graceful shutdown, wired into `AppState` too so
+    // `POST /shutdown` can trigger it (e.g. a TUI restarting a stale daemon).
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
 
     // Build app state
     let setup_cache = Arc::new(tokio::sync::RwLock::new(SetupCache::default()));
@@ -119,11 +144,10 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
         gh_client: gh_client.clone(),
         setup_cache: setup_cache.clone(),
         auth: Box::new(SetupAuthImpl),
+        llm_cache: llm_cache.clone(),
+        shutdown: shutdown.clone(),
+        binary_mtime: binary_mtime(),
     });
-
-    // Cancellation token for graceful shutdown
-    let shutdown = CancellationToken::new();
-    let shutdown_clone = shutdown.clone();
 
     // Spawn poller
     let poller_store = store.clone();
@@ -137,6 +161,7 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
             poller_config_rx,
             poller_state,
             classifier,
+            llm_cache,
             poller_shutdown,
         )
         .await;
@@ -203,4 +228,18 @@ fn remove_pid_file() {
         let pid_path = dir.join("daemon.pid");
         let _ = std::fs::remove_file(&pid_path);
     }
+}
+
+/// Modification time (unix seconds) of the currently running executable.
+/// Used to let a TUI client detect that an already-running daemon is a stale
+/// build (started before the binary on disk was last rebuilt) and restart
+/// it, since the OS keeps a replaced binary's old inode alive for any
+/// process that already has it open.
+pub fn binary_mtime() -> Option<u64> {
+    let exe = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(exe).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }

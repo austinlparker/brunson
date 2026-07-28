@@ -10,6 +10,7 @@ use axum::{
     Router,
 };
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
 use crate::config::{default_endpoint_for_provider, Config};
@@ -17,8 +18,10 @@ use crate::daemon::poller::PollState;
 use crate::daemon::setup_status::{evaluate_setup, SetupAuth, SetupCache};
 use crate::daemon::store::SharedStore;
 use crate::github::client::GitHubClient;
-use crate::github::types::parse_slug;
+use crate::github::types::{parse_slug, PrGroup};
 use crate::llm::classifier::Classifier;
+use crate::llm::LlmClassificationCache;
+use tracing::warn;
 
 /// Shared application state for all handlers.
 pub struct AppState {
@@ -31,6 +34,12 @@ pub struct AppState {
     pub gh_client: Arc<tokio::sync::RwLock<Option<GitHubClient>>>,
     pub setup_cache: Arc<tokio::sync::RwLock<SetupCache>>,
     pub auth: Box<dyn SetupAuth + Send + Sync>,
+    pub llm_cache: Arc<tokio::sync::RwLock<LlmClassificationCache>>,
+    /// Triggers graceful shutdown when cancelled (see `POST /shutdown`).
+    pub shutdown: CancellationToken,
+    /// This daemon's own binary mtime, reported via `/health` so clients can
+    /// detect a stale daemon left running from before a rebuild.
+    pub binary_mtime: Option<u64>,
 }
 
 impl AppState {
@@ -44,8 +53,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handle_health))
         .route("/setup/status", get(handle_setup_status))
+        .route("/setup/memberships", get(handle_setup_memberships))
         .route("/config", get(handle_config))
         .route("/config/preview", get(handle_config_preview))
+        .route("/config/preview_counts", post(handle_config_preview_counts))
         .route("/config/validate", post(handle_config_validate))
         .route("/config/reload", post(handle_config_reload))
         .route("/prs", get(handle_prs))
@@ -53,7 +64,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/prs/:id", get(handle_pr_detail))
         .route("/prs/:id/diff", get(handle_pr_diff))
         .route("/prs/:id/classify", post(handle_classify))
+        .route("/prs/:id/seen", post(handle_seen))
+        .route("/shutdown", post(handle_shutdown))
         .with_state(state)
+}
+
+/// Trigger a graceful shutdown. Used by the TUI to retire a stale daemon
+/// (one running an older build than the binary on disk) before spawning a
+/// fresh one. Returns immediately; the actual shutdown happens async.
+async fn handle_shutdown(State(state): State<Arc<AppState>>) -> StatusCode {
+    warn!("Shutdown requested via API");
+    state.shutdown.cancel();
+    StatusCode::ACCEPTED
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -76,6 +98,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
         refresh_in_progress: s.refresh_in_progress,
         setup_status,
         setup_message,
+        binary_mtime: state.binary_mtime,
     })
 }
 
@@ -107,10 +130,9 @@ async fn handle_prs(State(state): State<Arc<AppState>>) -> Json<PrListResponse> 
     let s = state.store.read().await;
     let grouped = s.group_prs();
 
-    let mut groups: HashMap<String, Vec<PrSummary>> = HashMap::new();
+    let mut groups: HashMap<PrGroup, Vec<PrSummary>> = HashMap::new();
 
     for (group, prs) in grouped {
-        let key = group_key(&group);
         let summaries: Vec<PrSummary> = prs
             .iter()
             .map(|pr| PrSummary {
@@ -121,16 +143,17 @@ async fn handle_prs(State(state): State<Arc<AppState>>) -> Json<PrListResponse> 
                 number: pr.number,
                 title: pr.title.clone(),
                 author: pr.author.clone(),
-                group: key.clone(),
+                author_is_bot: pr.author_is_bot,
+                group,
                 next_action: s.next_action(pr).to_string(),
-                check_status: check_status_string(&pr.check_status),
+                check_status: pr.check_status,
                 llm_priority: pr.llm_priority,
                 updated_at: pr.updated_at.clone(),
                 url: pr.url.clone(),
                 comments: s.comment_count(pr),
             })
             .collect();
-        groups.insert(key, summaries);
+        groups.insert(group, summaries);
     }
 
     let updated_at = s.last_poll_at.map(|dt| dt.to_rfc3339()).unwrap_or_default();
@@ -183,18 +206,10 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
         updated_at: pr.updated_at.clone(),
         head_ref: pr.head_ref.clone(),
         base_ref: pr.base_ref.clone(),
-        mergeable: serde_json::to_value(pr.mergeable)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default(),
-        review_decision: pr.review_decision.as_ref().map(|rd| {
-            serde_json::to_value(rd)
-                .unwrap_or_default()
-                .to_string()
-                .trim_matches('"')
-                .to_string()
-        }),
+        mergeable: pr.mergeable,
+        review_decision: pr.review_decision,
         review_requests: pr.review_requests.clone(),
+        team_review_requests: pr.team_review_requests.clone(),
         viewer_latest_review: pr.viewer_latest_review.clone(),
         latest_reviews: pr
             .latest_reviews
@@ -204,7 +219,7 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
                 state: r.state.clone(),
             })
             .collect(),
-        check_status: check_status_string(&pr.check_status),
+        check_status: pr.check_status,
         checks: pr
             .checks
             .iter()
@@ -247,10 +262,7 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
             .timeline
             .iter()
             .map(|e| TimelineEventDto {
-                event_type: serde_json::to_value(&e.event_type)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| "other".to_string()),
+                event_type: e.event_type.clone(),
                 actor: e.actor.clone(),
                 created_at: e.created_at.clone(),
                 detail: e.detail.clone(),
@@ -258,6 +270,8 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
             .collect(),
         llm_priority: pr.llm_priority,
         llm_summary: pr.llm_summary.clone(),
+        llm_rich_summary: pr.llm_rich_summary.clone(),
+        last_seen_at: pr.last_seen_at,
     };
 
     Json(detail).into_response()
@@ -375,27 +389,21 @@ async fn handle_refresh(State(state): State<Arc<AppState>>) -> Response {
         }
     }
 
-    // Check if refresh is already running
+    // Check-and-set the flag under a single write lock so two concurrent
+    // POSTs can't both observe `false` and both trigger a refresh.
     let already_running = {
-        let s = state.store.read().await;
-        s.refresh_in_progress
+        let mut s = state.store.write().await;
+        if s.refresh_in_progress {
+            true
+        } else {
+            s.refresh_in_progress = true;
+            false
+        }
     };
 
-    if already_running {
-        return (
-            StatusCode::ACCEPTED,
-            Json(RefreshResponse {
-                refresh_in_progress: true,
-            }),
-        )
-            .into_response();
+    if !already_running {
+        state.poll_state.trigger_refresh();
     }
-
-    {
-        let mut s = state.store.write().await;
-        s.refresh_in_progress = true;
-    }
-    state.poll_state.trigger_refresh();
 
     (
         StatusCode::ACCEPTED,
@@ -461,15 +469,41 @@ async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         }
     };
 
-    // Run classification
-    match classifier.classify(&pr).await {
+    // Run the richer catch-up / next-steps classification scoped to when the
+    // user last looked at this PR.
+    let last_seen_at = pr.last_seen_at;
+    match classifier.classify_rich(&pr, last_seen_at).await {
         Ok(result) => {
-            let mut s = state.store.write().await;
-            if let Some(stored_pr) = s.prs.get_mut(&pr.node_id) {
-                stored_pr.llm_priority = Some(result.priority);
-                stored_pr.llm_summary = Some(result.summary);
+            let rich_summary = crate::github::types::LlmRichSummary {
+                one_line: result.one_line.clone(),
+                catch_up: result.catch_up,
+                next_steps: result.next_steps,
+                generated_at: chrono::Utc::now(),
+                prompt_version: crate::llm::RICH_PROMPT_VERSION,
+            };
+            let pr_for_cache = {
+                let mut s = state.store.write().await;
+                if let Some(stored_pr) = s.prs.get_mut(&pr.node_id) {
+                    stored_pr.llm_priority = Some(result.priority);
+                    stored_pr.llm_summary = Some(result.one_line);
+                    stored_pr.llm_rich_summary = Some(rich_summary);
+                    Some(stored_pr.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(pr) = pr_for_cache {
+                {
+                    let mut cache = state.llm_cache.write().await;
+                    cache.update_from_pr(&pr);
+                }
+                let snapshot = { state.llm_cache.read().await.clone() };
+                if let Err(e) = snapshot.flush().await {
+                    warn!("Failed to persist LLM cache after classification: {}", e);
+                }
             }
-            drop(s);
+
             (
                 StatusCode::OK,
                 Json(ClassifyResponse {
@@ -487,6 +521,66 @@ async fn handle_classify(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         )
             .into_response(),
     }
+}
+
+async fn handle_seen(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let (owner, repo, number) = match parse_slug(&id) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(format!("Invalid PR slug '{}'", id))),
+            )
+                .into_response();
+        }
+    };
+
+    let node_id = {
+        let s = state.store.read().await;
+        match s.get_by_slug(&id) {
+            Some(pr) => pr.node_id.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::not_found(format!(
+                        "PR {}/{}/{} not found",
+                        owner, repo, number
+                    ))),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let seen_at = chrono::Utc::now();
+    let updated_at = {
+        let mut s = state.store.write().await;
+        match s.prs.get_mut(&node_id) {
+            Some(stored_pr) => {
+                stored_pr.last_seen_at = Some(seen_at);
+                stored_pr.updated_at.clone()
+            }
+            None => String::new(),
+        }
+    };
+
+    {
+        let mut cache = state.llm_cache.write().await;
+        cache.record_seen(&node_id, &updated_at, seen_at);
+    }
+    let snapshot = { state.llm_cache.read().await.clone() };
+    if let Err(e) = snapshot.flush().await {
+        warn!("Failed to persist seen timestamp for {}: {}", id, e);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "seen_at": seen_at,
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -526,6 +620,114 @@ async fn handle_config_validate(Json(mut config): Json<Config>) -> Json<ConfigVa
             },
         }),
     }
+}
+
+/// Fetch the orgs/teams the authenticated viewer belongs to, so a setup UI
+/// can offer them as choices instead of requiring the user to type team
+/// slugs from memory.
+async fn handle_setup_memberships(State(state): State<Arc<AppState>>) -> Response {
+    let client = {
+        let gh = state.gh_client.read().await;
+        match gh.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::service_unavailable(
+                        "Cannot fetch memberships: GitHub auth/client is not available",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    match crate::github::graphql::fetch_viewer_org_team_memberships(&client).await {
+        Ok((orgs, truncated)) => Json(MembershipsResponse {
+            orgs: orgs
+                .into_iter()
+                .map(|org| OrgMemberships {
+                    login: org.login,
+                    teams: org
+                        .teams
+                        .into_iter()
+                        .map(|team| TeamMembership {
+                            slug: team.slug,
+                            name: team.name,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            truncated,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                code: "upstream_error".to_string(),
+                message: format!("Failed to fetch org/team memberships: {}", e),
+                retryable: true,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Actually execute a candidate config's search queries against GitHub and
+/// return a deduplicated match count, so a setup UI can show "here's what
+/// you'll see" before the user commits the config — not just the query
+/// strings `/config/preview` returns.
+async fn handle_config_preview_counts(
+    State(state): State<Arc<AppState>>,
+    Json(mut config): Json<Config>,
+) -> Response {
+    config.resolve_llm_defaults();
+    if let Err(e) = config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(e.to_string())),
+        )
+            .into_response();
+    }
+
+    let client = {
+        let gh = state.gh_client.read().await;
+        match gh.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::service_unavailable(
+                        "Cannot preview: GitHub auth/client is not available",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let specs = crate::github::search::build_query_specs_for_config(&config.github);
+    let queries: Vec<String> = specs.iter().map(|spec| spec.query.clone()).collect();
+
+    let fetches = specs.iter().map(|spec| {
+        let client = &client;
+        async move {
+            client
+                .search_prs(&spec.query, 1)
+                .await
+                .map(|resp| resp.to_results())
+                .map_err(|e| format!("query '{}': {}", spec.query, e))
+        }
+    });
+    let results = futures::future::join_all(fetches).await;
+    let (total_matched_prs, errors) = crate::github::search::aggregate_preview_counts(results);
+
+    Json(ConfigPreviewCountsResponse {
+        queries,
+        total_matched_prs,
+        errors,
+    })
+    .into_response()
 }
 
 async fn handle_config_reload(
@@ -642,6 +844,7 @@ mod tests {
             body: "Description".into(),
             url: "https://github.com/org/repo/pull/42".into(),
             author: "other".into(),
+            author_is_bot: false,
             owner: "org".into(),
             repo: "repo".into(),
             is_draft: false,
@@ -651,6 +854,7 @@ mod tests {
             mergeable: MergeableState::Unknown,
             review_decision: None,
             review_requests: vec!["me".into()],
+            team_review_requests: vec![],
             viewer_latest_review: None,
             latest_reviews: vec![],
             check_status: CheckStatus::None,
@@ -661,6 +865,8 @@ mod tests {
             comments: 0,
             llm_priority: None,
             llm_summary: None,
+            llm_rich_summary: None,
+            last_seen_at: None,
         }]
     }
 
@@ -683,6 +889,9 @@ mod tests {
             gh_client: Arc::new(tokio::sync::RwLock::new(None)),
             setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
             auth: Box::new(crate::daemon::setup_status::SetupAuthImpl),
+            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            shutdown: CancellationToken::new(),
+            binary_mtime: Some(1),
         })
     }
 
@@ -710,6 +919,34 @@ mod tests {
         assert_eq!(json["service"], crate::daemon::SERVICE_NAME);
         assert_eq!(json["status"], "ok");
         assert_eq!(json["current_user"], "testuser");
+        assert_eq!(json["binary_mtime"], 1);
+    }
+
+    // Regression test: `POST /shutdown` must trigger the daemon's
+    // cancellation token so a client (the TUI) can retire a stale daemon
+    // before spawning a fresh one.
+    #[tokio::test]
+    async fn test_shutdown_endpoint_cancels_token() {
+        let store = PrStore::new("testuser".into());
+        let state = make_test_state(store);
+        let shutdown = state.shutdown.clone();
+        let app = build_router(state);
+
+        assert!(!shutdown.is_cancelled());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/shutdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(shutdown.is_cancelled());
     }
 
     #[tokio::test]
@@ -782,6 +1019,74 @@ mod tests {
         assert!(!json.valid);
         assert!(json.error.unwrap().contains("cannot set both"));
         assert!(json.preview.queries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_setup_memberships_without_gh_client_returns_503() {
+        let state = make_test_state(PrStore::new("me".into()));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/setup/memberships")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_config_preview_counts_without_gh_client_returns_503() {
+        let state = make_test_state(PrStore::new("me".into()));
+        let app = build_router(state);
+        let body = serde_json::to_vec(&Config::default()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/preview_counts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_config_preview_counts_rejects_invalid_config() {
+        let mut config = Config::default();
+        config.github.targets.push(crate::config::GithubTarget {
+            org: Some("myorg".to_string()),
+            repo: Some("myorg/repo".to_string()),
+            ..Default::default()
+        });
+        let state = make_test_state(PrStore::new("me".into()));
+        let app = build_router(state);
+        let body = serde_json::to_vec(&config).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/preview_counts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Invalid config is rejected before the (unavailable) GitHub client
+        // would even be checked.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1030,6 +1335,9 @@ mod tests {
                 fail_token: false,
                 fail_login: false,
             }),
+            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            shutdown: CancellationToken::new(),
+            binary_mtime: Some(1),
         })
     }
 
@@ -1053,6 +1361,9 @@ mod tests {
             gh_client: Arc::new(tokio::sync::RwLock::new(None)),
             setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
             auth,
+            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            shutdown: CancellationToken::new(),
+            binary_mtime: Some(1),
         })
     }
 
@@ -1249,6 +1560,61 @@ enabled = false
         let store = state.store.read().await;
         assert_eq!(store.current_user, "unknown");
         assert!(store.last_poll_error.is_some());
+    }
+
+    // Regression test: a transient viewer-login failure must not discard an
+    // otherwise-working GitHub client. Only a token/client failure should.
+    #[tokio::test]
+    async fn test_config_reload_login_failure_keeps_working_client() {
+        let toml = r#"
+[github]
+watch = []
+poll_interval = 120
+
+[daemon]
+port = 17891
+
+[llm]
+enabled = false
+"#;
+        let path = write_temp_config(toml);
+        let config = Config::load(Some(&path)).unwrap();
+        let state = make_test_state_with_auth(
+            config,
+            Some(path),
+            Box::new(TestAuth {
+                user: "newuser".into(),
+                fail_token: false,
+                fail_login: true,
+            }),
+        );
+        {
+            let mut store = state.store.write().await;
+            store.current_user = "olduser".to_string();
+        }
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reloaded"], true);
+        assert!(json["error"].is_null());
+        assert!(state.gh_client.read().await.is_some());
+        let store = state.store.read().await;
+        assert_eq!(store.current_user, "unknown");
     }
 
     #[tokio::test]

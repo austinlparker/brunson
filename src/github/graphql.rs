@@ -3,6 +3,7 @@ use serde_json::json;
 use tracing::{debug, warn};
 
 use super::client::GitHubClient;
+use super::search::normalize_team_identifier;
 use super::types::*;
 
 /// Fetch the current viewer's login.
@@ -14,6 +15,135 @@ pub async fn fetch_viewer_login(client: &GitHubClient) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Could not extract viewer login from GraphQL response"))?
         .to_string();
     Ok(login)
+}
+
+/// Fetch which configured teams currently include the viewer.
+pub async fn fetch_viewer_team_memberships(
+    client: &GitHubClient,
+    configured_teams: &std::collections::HashSet<String>,
+    viewer_login: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let checks = configured_teams.iter().map(|team| async move {
+        let (org, slug) = team
+            .split_once('/')
+            .ok_or_else(|| anyhow!("invalid normalized team identifier: {}", team))?;
+        let is_member = viewer_is_team_member(client, org, slug, viewer_login).await?;
+        Ok::<_, anyhow::Error>(is_member.then(|| team.clone()))
+    });
+    let results = futures::future::try_join_all(checks).await?;
+    Ok(results.into_iter().flatten().collect())
+}
+
+/// Fetch every org the viewer belongs to, and their teams within each org.
+/// Unlike `fetch_viewer_team_memberships` (which checks membership of
+/// specific, already-configured teams), this enumerates everything so a
+/// setup UI can offer them as choices instead of requiring the user to type
+/// team slugs from memory.
+pub async fn fetch_viewer_org_team_memberships(
+    client: &GitHubClient,
+) -> Result<(Vec<OrgMembership>, bool)> {
+    let viewer_login = fetch_viewer_login(client).await?;
+    let query = r#"query($viewer: [String!]) {
+      viewer {
+        organizations(first: 100) {
+          pageInfo { hasNextPage }
+          nodes {
+            login
+            teams(first: 100, userLogins: $viewer) {
+              pageInfo { hasNextPage }
+              nodes { slug name }
+            }
+          }
+        }
+      }
+    }"#;
+    let resp = client
+        .graphql_with_variables(query, json!({ "viewer": [viewer_login] }))
+        .await?;
+    Ok(parse_memberships_json(&resp))
+}
+
+/// Parse the response of `fetch_viewer_org_team_memberships`'s query,
+/// separated from the network call so it's testable against fixture JSON.
+fn parse_memberships_json(json: &serde_json::Value) -> (Vec<OrgMembership>, bool) {
+    let orgs_conn = &json["data"]["viewer"]["organizations"];
+    let mut truncated = orgs_conn["pageInfo"]["hasNextPage"]
+        .as_bool()
+        .unwrap_or(false);
+
+    let orgs = orgs_conn["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|org| {
+                    let login = org["login"].as_str()?.to_string();
+                    let teams_conn = &org["teams"];
+                    if teams_conn["pageInfo"]["hasNextPage"]
+                        .as_bool()
+                        .unwrap_or(false)
+                    {
+                        truncated = true;
+                    }
+                    let teams = teams_conn["nodes"]
+                        .as_array()
+                        .map(|team_nodes| {
+                            team_nodes
+                                .iter()
+                                .filter_map(|team| {
+                                    Some(TeamMembership {
+                                        slug: team["slug"].as_str()?.to_string(),
+                                        name: team["name"].as_str().unwrap_or("").to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(OrgMembership { login, teams })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (orgs, truncated)
+}
+
+async fn viewer_is_team_member(
+    client: &GitHubClient,
+    org: &str,
+    slug: &str,
+    viewer_login: &str,
+) -> Result<bool> {
+    let query = r#"query($org: String!, $slug: String!, $viewer: String!) {
+      organization(login: $org) {
+        team(slug: $slug) {
+          members(first: 100, query: $viewer) {
+            nodes { login }
+          }
+        }
+      }
+    }"#;
+    let resp = client
+        .graphql_with_variables(
+            query,
+            json!({ "org": org, "slug": slug, "viewer": viewer_login }),
+        )
+        .await?;
+    let team = &resp["data"]["organization"]["team"];
+    if team.is_null() {
+        return Ok(false);
+    }
+    Ok(team["members"]["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes.iter().any(|node| {
+                node["login"]
+                    .as_str()
+                    .map(|login| login.eq_ignore_ascii_case(viewer_login))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false))
 }
 
 const MAX_CONNECTION_PAGES: usize = 20;
@@ -41,7 +171,7 @@ const PR_DETAIL_QUERY: &str = r#"query(
     url
     isDraft
     updatedAt
-    author { login }
+    author { login __typename }
     headRefName
     baseRefName
     mergeable
@@ -54,6 +184,7 @@ const PR_DETAIL_QUERY: &str = r#"query(
       nodes {
         requestedReviewer {
           ... on User { login }
+          ... on Team { slug name organization { login } }
         }
       }
     }
@@ -147,7 +278,10 @@ const PR_DETAIL_QUERY: &str = r#"query(
         ... on ReviewRequestedEvent {
           actor { login }
           createdAt
-          requestedReviewer { ... on User { login } }
+          requestedReviewer {
+            ... on User { login }
+            ... on Team { slug name organization { login } }
+          }
         }
         ... on ReviewDismissedEvent {
           actor { login }
@@ -263,6 +397,7 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         .as_str()
         .unwrap_or("unknown")
         .to_string();
+    let author_is_bot = pr["author"]["__typename"].as_str() == Some("Bot");
     let is_draft = pr["isDraft"].as_bool().unwrap_or(false);
     let updated_at = pr["updatedAt"].as_str().unwrap_or("").to_string();
     let head_ref = pr["headRefName"].as_str().unwrap_or("").to_string();
@@ -281,15 +416,7 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         _ => None,
     };
 
-    let review_requests: Vec<String> = pr["reviewRequests"]["nodes"]
-        .as_array()
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|n| n["requestedReviewer"]["login"].as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let (review_requests, team_review_requests) = parse_review_requests(&pr["reviewRequests"]["nodes"]);
 
     let viewer_latest_review = pr["viewerLatestReview"]["state"].as_str().map(String::from);
 
@@ -321,6 +448,7 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         body,
         url,
         author,
+        author_is_bot,
         owner: owner.to_string(),
         repo: repo.to_string(),
         is_draft,
@@ -330,6 +458,7 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         mergeable,
         review_decision,
         review_requests,
+        team_review_requests,
         viewer_latest_review,
         latest_reviews,
         check_status,
@@ -340,7 +469,35 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         comments: 0,
         llm_priority: None,
         llm_summary: None,
+        llm_rich_summary: None,
+        last_seen_at: None,
     }
+}
+
+fn parse_review_requests(nodes: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut users = Vec::new();
+    let mut teams = Vec::new();
+
+    if let Some(nodes) = nodes.as_array() {
+        for node in nodes {
+            let reviewer = &node["requestedReviewer"];
+            if let Some(login) = reviewer["login"].as_str() {
+                users.push(login.to_string());
+                continue;
+            }
+            if let Some(team) = normalize_team_reviewer(reviewer) {
+                teams.push(team);
+            }
+        }
+    }
+
+    (users, teams)
+}
+
+fn normalize_team_reviewer(reviewer: &serde_json::Value) -> Option<String> {
+    let org = reviewer["organization"]["login"].as_str()?;
+    let slug = reviewer["slug"].as_str()?;
+    normalize_team_identifier(&format!("{org}/{slug}"))
 }
 
 fn parse_checks(commits: &serde_json::Value) -> (CheckStatus, Vec<CheckEntry>) {
@@ -508,7 +665,9 @@ fn parse_timeline(nodes: &serde_json::Value) -> Vec<TimelineEvent> {
                         "ReviewRequestedEvent" => {
                             let target = n["requestedReviewer"]["login"]
                                 .as_str()
-                                .unwrap_or("someone");
+                                .map(String::from)
+                                .or_else(|| normalize_team_reviewer(&n["requestedReviewer"]))
+                                .unwrap_or_else(|| "someone".to_string());
                             (
                                 TimelineEventType::ReviewRequested,
                                 n["actor"]["login"]
@@ -696,14 +855,13 @@ async fn paginate_pr_connection(
     let mut pages = 1usize;
     while let Some(cursor) = next_cursor(pr_connection(merged, connection)) {
         if pages >= MAX_CONNECTION_PAGES {
-            return Err(anyhow!(
-                "GraphQL {} pagination exceeded {} pages for {}/{}/{}",
-                connection,
-                MAX_CONNECTION_PAGES,
-                owner,
-                repo,
-                number
-            ));
+            // Truncate this one connection rather than failing the whole PR
+            // (and the whole poll cycle) over a single oversized PR.
+            warn!(
+                "GraphQL {} pagination exceeded {} pages for {}/{}/{}; truncating",
+                connection, MAX_CONNECTION_PAGES, owner, repo, number
+            );
+            break;
         }
 
         let vars = match connection {
@@ -744,11 +902,13 @@ async fn paginate_review_thread_comments(
         let mut pages = 1usize;
         while let Some(cursor) = next_cursor(thread.get("comments")) {
             if pages >= MAX_CONNECTION_PAGES {
-                return Err(anyhow!(
-                    "GraphQL review thread comments pagination exceeded {} pages for thread {}",
-                    MAX_CONNECTION_PAGES,
-                    thread_id
-                ));
+                // Truncate this thread's comments rather than failing the
+                // whole PR (and the whole poll cycle) over one big thread.
+                warn!(
+                    "GraphQL review thread comments pagination exceeded {} pages for thread {}; truncating",
+                    MAX_CONNECTION_PAGES, thread_id
+                );
+                break;
             }
             let page = client
                 .graphql_with_variables(
@@ -986,6 +1146,58 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_review_requests_includes_users_and_teams() {
+        let pr_json = json!({
+            "id": "PR_node1",
+            "number": 42,
+            "title": "Fix bug",
+            "body": "Description",
+            "url": "https://github.com/MyOrg/repo/pull/42",
+            "isDraft": false,
+            "updatedAt": "2024-01-15T10:30:00Z",
+            "author": { "login": "alice" },
+            "headRefName": "feature",
+            "baseRefName": "main",
+            "mergeable": "MERGEABLE",
+            "reviewDecision": "APPROVED",
+            "reviewRequests": {
+                "nodes": [
+                    { "requestedReviewer": { "login": "bob" } },
+                    { "requestedReviewer": {
+                        "slug": "Team-A",
+                        "name": "Team A",
+                        "organization": { "login": "MyOrg" }
+                    } }
+                ]
+            },
+            "viewerLatestReview": null,
+            "latestReviews": { "nodes": [] },
+            "commits": { "nodes": [] },
+            "reviewThreads": { "nodes": [] },
+            "timelineItems": {
+                "nodes": [{
+                    "__typename": "ReviewRequestedEvent",
+                    "actor": { "login": "alice" },
+                    "createdAt": "2024-01-15T10:31:00Z",
+                    "requestedReviewer": {
+                        "slug": "Team-A",
+                        "name": "Team A",
+                        "organization": { "login": "MyOrg" }
+                    }
+                }]
+            },
+            "files": { "nodes": [] }
+        });
+
+        let pr = parse_single_pr(&pr_json, "MyOrg", "repo");
+        assert_eq!(pr.review_requests, vec!["bob"]);
+        assert_eq!(pr.team_review_requests, vec!["myorg/team-a"]);
+        assert_eq!(pr.timeline.len(), 1);
+        assert_eq!(pr.timeline[0].event_type, TimelineEventType::ReviewRequested);
+        assert_eq!(pr.timeline[0].detail, "Requested review from myorg/team-a");
+    }
+
+    #[test]
     fn test_parse_checks_checkrun() {
         let commits = json!([{
             "commit": {
@@ -1189,5 +1401,81 @@ mod tests {
         assert_eq!(files[3].status, 'R');
         assert_eq!(files[4].status, 'M');
         assert_eq!(files[5].status, '?');
+    }
+
+    #[test]
+    fn test_parse_memberships_json_collects_orgs_and_teams() {
+        let resp = json!({
+            "data": {
+                "viewer": {
+                    "organizations": {
+                        "pageInfo": { "hasNextPage": false },
+                        "nodes": [
+                            {
+                                "login": "myorg",
+                                "teams": {
+                                    "pageInfo": { "hasNextPage": false },
+                                    "nodes": [
+                                        { "slug": "team-a", "name": "Team A" },
+                                        { "slug": "team-b", "name": "Team B" }
+                                    ]
+                                }
+                            },
+                            {
+                                "login": "otherorg",
+                                "teams": {
+                                    "pageInfo": { "hasNextPage": false },
+                                    "nodes": []
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let (orgs, truncated) = parse_memberships_json(&resp);
+        assert!(!truncated);
+        assert_eq!(orgs.len(), 2);
+        assert_eq!(orgs[0].login, "myorg");
+        assert_eq!(orgs[0].teams.len(), 2);
+        assert_eq!(orgs[0].teams[0].slug, "team-a");
+        assert_eq!(orgs[0].teams[0].name, "Team A");
+        assert_eq!(orgs[1].login, "otherorg");
+        assert!(orgs[1].teams.is_empty());
+    }
+
+    #[test]
+    fn test_parse_memberships_json_marks_truncated_on_either_page_info() {
+        let org_page_truncated = json!({
+            "data": { "viewer": { "organizations": {
+                "pageInfo": { "hasNextPage": true },
+                "nodes": []
+            }}}
+        });
+        let (_, truncated) = parse_memberships_json(&org_page_truncated);
+        assert!(truncated);
+
+        let team_page_truncated = json!({
+            "data": { "viewer": { "organizations": {
+                "pageInfo": { "hasNextPage": false },
+                "nodes": [{
+                    "login": "myorg",
+                    "teams": {
+                        "pageInfo": { "hasNextPage": true },
+                        "nodes": []
+                    }
+                }]
+            }}}
+        });
+        let (orgs, truncated) = parse_memberships_json(&team_page_truncated);
+        assert!(truncated);
+        assert_eq!(orgs.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_memberships_json_handles_missing_data() {
+        let (orgs, truncated) = parse_memberships_json(&json!({}));
+        assert!(orgs.is_empty());
+        assert!(!truncated);
     }
 }

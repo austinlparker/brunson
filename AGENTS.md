@@ -123,6 +123,12 @@ classify_on_change = true
 max_output_tokens = 4096
 EOF
 
+# Note: team_review_requests entries use GitHub team slugs (`org/team-slug`).
+# A team-only PR remains tracked only while the PR still requests that team and
+# the authenticated viewer is still a current member. If GitHub cannot answer
+# the membership check, Brunson fails the refresh safely and preserves the
+# existing PR list instead of dropping data.
+
 # 3. If the daemon is already running, ask it to reload
 #    (otherwise it will pick up the config on the next start)
 curl -s -X POST http://localhost:17890/config/reload
@@ -145,9 +151,9 @@ done
 | 4 | Files | green | Changed-file picker with status, additions, deletions |
 | 5 | Diff | teal | Unified diff with two-number gutter and inline review comments |
 
-Navigation: `←/h` back, `→/l/Enter` deeper, `1`–`5` jump, `j/k`/`↑↓` scroll, `c` config preview, `R` refresh, `q` quit.
+Navigation: `←/h` back, `→/l/Enter` deeper, `1`–`5` jump, `j/k`/`↑↓` scroll, `/` filter inbox, `c` config preview, `R` refresh, `q` quit.
 
-The status line at the bottom shows the selected PR title, current blade, and a block cursor; the keybar below it lists bindings. Press `o` to open the selected PR in a browser. (PR titles and file paths are intentionally not rendered as OSC 8 hyperlinks — doing so via `Cell::set_symbol` corrupts ratatui 0.30's cell-width calculation and breaks the selection highlight.)
+The status line at the bottom shows the selected PR title, current blade, and data staleness; the keybar below it lists bindings. Press `o` to open the selected PR in a browser. (PR titles and file paths are intentionally not rendered as OSC 8 hyperlinks — doing so via `Cell::set_symbol` corrupts ratatui 0.30's cell-width calculation and breaks the selection highlight.)
 
 Inside the Inbox, the daemon's eight internal `PrGroup` values are folded into exactly two display sections:
 
@@ -161,7 +167,7 @@ The TUI is built from a small tree of reusable, layout-first components under `s
 - **`Component` trait** (`component.rs`) — pure renderers that take a read-only `RenderContext<'a> { state: &AppState, view: &ViewState, theme: &Theme }`. Leaf renderers never mutate `AppState`; all scroll clamping happens in `ViewStateManager::prepare` before the frame is drawn.
 - **`RootLayout`** (`layout.rs`) — owns the outer geometry (body / command line / keybar) and the five-blade horizontal split, plus the 50×12 minimum-size splash. Produces a `ViewLayout` every child reads. `Blade` is defined here.
 - **`ScrollViewport`** (`primitives.rs`) — one reusable virtualized list used by Inbox, Files, Activity, Diff, and Overview section bodies. Handles windowing, scrollbar, and offset slicing over a flattened `&[Line]`.
-- **`InlineToast`** (`chrome.rs`) — centered overlay for errors and action-stub feedback; the keybar is never replaced by an error string.
+- **`InlineToast`** (`chrome.rs`) — centered overlay for errors and diagnostic feedback; the keybar is never replaced by an error string.
 
 State is split: domain/cache data lives in `AppState` (`src/tui/app.rs`); transient navigation, focus, and scroll state lives in `ViewState`/`ViewStateManager` (`src/tui/state.rs`). `ViewStateManager::prepare` is the single place that recomputes the flat PR list, reconciles selection, and clamps scroll offsets each frame. Expensive markdown/diff parsing is cached in `RenderCache` (`render/cache.rs`) so it does not run every frame.
 
