@@ -16,7 +16,12 @@ pub struct InlineToast;
 
 impl Component for InlineToast {
     fn render(&self, f: &mut Frame, area: Rect, ctx: &RenderContext) {
-        let Some(message) = ctx.state.error_message.as_deref() else {
+        let Some(message) = ctx
+            .state
+            .error_message
+            .as_deref()
+            .or(ctx.state.transient_message.as_deref())
+        else {
             return;
         };
         if area.width < 8 || area.height < 3 {

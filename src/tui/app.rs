@@ -143,8 +143,11 @@ pub struct AppState {
     pub pr_diff: Option<DiffResponse>,
     /// Show line numbers in diff view.
     pub show_line_numbers: bool,
-    /// Error message to display (toast).
+    /// Error message to display (persistent toast).
     pub error_message: Option<String>,
+    /// Informational toast that expires after a few UI ticks.
+    pub transient_message: Option<String>,
+    transient_message_ticks: u8,
     /// Daemon child process if we spawned it.
     pub daemon_child: Option<Child>,
     /// Loading state.
@@ -197,6 +200,8 @@ impl AppState {
             pr_diff: None,
             show_line_numbers,
             error_message: None,
+            transient_message: None,
+            transient_message_ticks: 0,
             daemon_child: None,
             loading: false,
             startup_phase: StartupPhase::Starting,
@@ -523,10 +528,26 @@ impl AppState {
 
         match copy_to_clipboard(&branch) {
             Ok(()) => {
-                self.error_message = Some(format!("Copied branch: {branch}"));
+                self.set_transient_message(format!("Copied branch: {branch}"));
             }
             Err(error) => {
                 self.error_message = Some(format!("Copy branch failed: {error}"));
+            }
+        }
+    }
+
+    fn set_transient_message(&mut self, message: String) {
+        self.transient_message = Some(message);
+        self.transient_message_ticks = 0;
+    }
+
+    fn advance_transient_message(&mut self) {
+        const TRANSIENT_MESSAGE_TICKS: u8 = 20;
+        if self.transient_message.is_some() {
+            self.transient_message_ticks = self.transient_message_ticks.saturating_add(1);
+            if self.transient_message_ticks >= TRANSIENT_MESSAGE_TICKS {
+                self.transient_message = None;
+                self.transient_message_ticks = 0;
             }
         }
     }
@@ -1612,6 +1633,7 @@ async fn run_render_loop(
 
         if ui_tick {
             state.ui_tick = state.ui_tick.wrapping_add(1);
+            state.advance_transient_message();
         }
         if data_tick
             && state.setup_wizard.is_none()
@@ -2569,6 +2591,22 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
+    }
+
+    #[test]
+    fn transient_messages_expire_without_clearing_errors() {
+        let mut state = make_test_state(HashMap::new());
+        state.set_transient_message("Copied branch: feature".to_string());
+        state.error_message = Some("persistent error".to_string());
+
+        for _ in 0..19 {
+            state.advance_transient_message();
+            assert!(state.transient_message.is_some());
+        }
+        state.advance_transient_message();
+
+        assert!(state.transient_message.is_none());
+        assert_eq!(state.error_message.as_deref(), Some("persistent error"));
     }
 
     #[test]
