@@ -41,7 +41,10 @@ pub async fn resolve_github_client_and_user(
     let login = match auth.viewer_login(&token, &host).await {
         Ok(login) => login,
         Err(e) => {
-            warn!("Failed to resolve viewer login (client still usable): {}", e);
+            warn!(
+                "Failed to resolve viewer login (client still usable): {}",
+                e
+            );
             "unknown".to_string()
         }
     };
@@ -110,7 +113,10 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
     // Load persisted LLM classification cache.
     let llm_cache = Arc::new(tokio::sync::RwLock::new(
         LlmClassificationCache::load().unwrap_or_else(|e| {
-            warn!("Failed to load LLM classification cache: {}. Starting fresh.", e);
+            warn!(
+                "Failed to load LLM classification cache: {}. Starting fresh.",
+                e
+            );
             LlmClassificationCache::default()
         }),
     ));

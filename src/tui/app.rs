@@ -790,10 +790,13 @@ impl AppState {
 
     /// The section enclosing the row at `row`: the nearest preceding header.
     fn enclosing_section(&self, view: &ViewStateManager, row: usize) -> Option<InboxSection> {
-        view.view.inbox_rows[..row].iter().rev().find_map(|r| match r {
-            InboxRow::Header { section, .. } => Some(*section),
-            InboxRow::Pr { .. } => None,
-        })
+        view.view.inbox_rows[..row]
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                InboxRow::Header { section, .. } => Some(*section),
+                InboxRow::Pr { .. } => None,
+            })
     }
 }
 
@@ -816,10 +819,9 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut out = std::io::stdout();
-        out.execute(EnterAlternateScreen)
-            .inspect_err(|_| {
-                let _ = disable_raw_mode();
-            })?;
+        out.execute(EnterAlternateScreen).inspect_err(|_| {
+            let _ = disable_raw_mode();
+        })?;
         out.execute(Hide).inspect_err(|_| {
             let _ = std::io::stdout().execute(LeaveAlternateScreen);
             let _ = disable_raw_mode();
@@ -1069,7 +1071,11 @@ fn coalesce_ticks(events: Vec<TuiEvent>) -> (bool, bool, Vec<TuiEvent>) {
 /// `POST /prs/refresh` (and the settle delay the daemon needs to act on it
 /// before the poller reflects it) ahead of the fetch; a periodic `DataTick`
 /// refresh skips that and just re-fetches.
-fn spawn_prs_refresh(event_tx: &mpsc::UnboundedSender<TuiEvent>, client: &DaemonClient, trigger: bool) {
+fn spawn_prs_refresh(
+    event_tx: &mpsc::UnboundedSender<TuiEvent>,
+    client: &DaemonClient,
+    trigger: bool,
+) {
     let tx = event_tx.clone();
     let client = client.clone();
     tokio::spawn(async move {
@@ -1448,7 +1454,10 @@ async fn run_render_loop(
                 let tx = event_tx.clone();
                 let client = state.client.clone();
                 tokio::spawn(async move {
-                    let res = client.get_org_memberships().await.map_err(|e| e.to_string());
+                    let res = client
+                        .get_org_memberships()
+                        .await
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(TuiEvent::WizardMembershipsLoaded(res));
                 });
             }
@@ -1658,7 +1667,12 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert(
             PrGroup::ReviewNeeded,
-            vec![make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", None)],
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
         );
         let mut state = make_test_state(groups);
         state.selected_pr_id = Some("org~repo~1".to_string());
@@ -1684,7 +1698,12 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert(
             PrGroup::ReviewNeeded,
-            vec![make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", None)],
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
         );
         let mut state = make_test_state(groups);
         let mut view = ViewStateManager::new();
@@ -1842,7 +1861,12 @@ mod tests {
         groups.insert(
             PrGroup::ReviewNeeded,
             vec![
-                make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+                make_summary(
+                    "org~repo~1",
+                    PrGroup::ReviewNeeded,
+                    "other",
+                    Some(Priority::High),
+                ),
                 make_summary(
                     "org~repo~2",
                     PrGroup::ReviewNeeded,
@@ -1853,7 +1877,12 @@ mod tests {
         );
         groups.insert(
             PrGroup::AuthoredWaiting,
-            vec![make_summary("org~repo~3", PrGroup::AuthoredWaiting, "me", None)],
+            vec![make_summary(
+                "org~repo~3",
+                PrGroup::AuthoredWaiting,
+                "me",
+                None,
+            )],
         );
 
         let mut state = make_test_state(groups);
@@ -1973,7 +2002,12 @@ mod tests {
         groups.insert(
             PrGroup::ReviewNeeded,
             vec![
-                make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+                make_summary(
+                    "org~repo~1",
+                    PrGroup::ReviewNeeded,
+                    "other",
+                    Some(Priority::High),
+                ),
                 make_summary(
                     "org~repo~2",
                     PrGroup::ReviewNeeded,
@@ -1984,7 +2018,12 @@ mod tests {
         );
         groups.insert(
             PrGroup::AuthoredWaiting,
-            vec![make_summary("org~repo~3", PrGroup::AuthoredWaiting, "me", None)],
+            vec![make_summary(
+                "org~repo~3",
+                PrGroup::AuthoredWaiting,
+                "me",
+                None,
+            )],
         );
         groups.insert(
             PrGroup::AuthoredReadyToMerge,
@@ -2073,7 +2112,12 @@ mod tests {
         groups.insert(
             PrGroup::ReviewNeeded,
             vec![
-                make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+                make_summary(
+                    "org~repo~1",
+                    PrGroup::ReviewNeeded,
+                    "other",
+                    Some(Priority::High),
+                ),
                 make_summary(
                     "org~repo~2",
                     PrGroup::ReviewNeeded,
@@ -2084,7 +2128,12 @@ mod tests {
         );
         groups.insert(
             PrGroup::AuthoredWaiting,
-            vec![make_summary("org~repo~3", PrGroup::AuthoredWaiting, "me", None)],
+            vec![make_summary(
+                "org~repo~3",
+                PrGroup::AuthoredWaiting,
+                "me",
+                None,
+            )],
         );
 
         let mut state = make_test_state(groups);
@@ -2186,7 +2235,12 @@ mod tests {
         groups.insert(
             PrGroup::ReviewNeeded,
             vec![
-                make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+                make_summary(
+                    "org~repo~1",
+                    PrGroup::ReviewNeeded,
+                    "other",
+                    Some(Priority::High),
+                ),
                 make_summary(
                     "org~repo~2",
                     PrGroup::ReviewNeeded,
@@ -2244,7 +2298,12 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert(
             PrGroup::ReviewNeeded,
-            vec![make_summary("org~repo~42", PrGroup::ReviewNeeded, "other", None)],
+            vec![make_summary(
+                "org~repo~42",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
         );
         let mut state = make_test_state(groups);
         state.selected_pr_id = Some("org~repo~42".to_string());
@@ -2543,7 +2602,10 @@ mod tests {
         assert_eq!(view.view.active_blade, Blade::Inbox);
 
         state.handle_key(&mut view, key(KeyCode::Esc));
-        assert!(state.search_filter.is_empty(), "first Esc clears the filter");
+        assert!(
+            state.search_filter.is_empty(),
+            "first Esc clears the filter"
+        );
         assert!(
             state.error_message.is_some(),
             "the toast survives while a filter is still active"
@@ -2576,7 +2638,10 @@ mod tests {
         state.handle_key(&mut view, key(KeyCode::Char('G')));
         assert_eq!(view.view.selected_row, 3, "G jumps to the last row");
         state.handle_key(&mut view, key(KeyCode::Char('g')));
-        assert_eq!(view.view.selected_row, 0, "g jumps to the first row (header)");
+        assert_eq!(
+            view.view.selected_row, 0,
+            "g jumps to the first row (header)"
+        );
     }
 
     #[test]
@@ -2673,14 +2738,8 @@ mod tests {
             found_title,
             "search overlay should render a Filter title/prompt"
         );
-        assert!(
-            found_input,
-            "search overlay should render the query prompt"
-        );
-        assert!(
-            found_hint,
-            "search overlay should render the hint line"
-        );
+        assert!(found_input, "search overlay should render the query prompt");
+        assert!(found_hint, "search overlay should render the hint line");
     }
 
     #[test]

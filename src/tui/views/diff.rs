@@ -358,7 +358,10 @@ mod tests {
 
         // First row keeps the deletion sign.
         let first: String = lines[0].spans.iter().map(|s| s.content.clone()).collect();
-        assert!(first.starts_with("− "), "first row should carry the sign: {first}");
+        assert!(
+            first.starts_with("− "),
+            "first row should carry the sign: {first}"
+        );
 
         // Continuation rows must use the wrap marker instead of repeating
         // the sign, or a wrapped deletion looks like a second deleted line.

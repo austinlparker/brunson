@@ -82,7 +82,11 @@ pub fn normalize_team_identifier(team: &str) -> Option<String> {
     if org.is_empty() || slug.is_empty() || slug.contains('/') {
         return None;
     }
-    Some(format!("{}/{}", org.to_ascii_lowercase(), slug.to_ascii_lowercase()))
+    Some(format!(
+        "{}/{}",
+        org.to_ascii_lowercase(),
+        slug.to_ascii_lowercase()
+    ))
 }
 
 pub fn configured_team_review_requests(config: &GithubConfig) -> HashSet<String> {
@@ -726,7 +730,9 @@ mod tests {
             ),
             ProvenancedSearchResult::new(
                 search_result("ORG", "REPO", 1),
-                SearchReason::TargetDirectReview { scope: scope.clone() },
+                SearchReason::TargetDirectReview {
+                    scope: scope.clone(),
+                },
             ),
         ]);
 
@@ -955,7 +961,11 @@ mod tests {
         ProvenancedSearchResult::new(search_result("myorg", "repo", number), reason)
     }
 
-    fn pull_request(author: &str, review_requests: Vec<&str>, team_requests: Vec<&str>) -> PullRequest {
+    fn pull_request(
+        author: &str,
+        review_requests: Vec<&str>,
+        team_requests: Vec<&str>,
+    ) -> PullRequest {
         PullRequest {
             node_id: format!("node-{}", review_requests.len() + team_requests.len()),
             number: 1,

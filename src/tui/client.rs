@@ -165,7 +165,10 @@ impl DaemonClient {
 
     /// Validate a candidate config without writing it (server-side
     /// `Config::validate`, same rules the daemon enforces on reload).
-    pub async fn validate_config(&self, config: &crate::config::Config) -> Result<ConfigValidateResponse> {
+    pub async fn validate_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> Result<ConfigValidateResponse> {
         self.post_json("/config/validate", config).await
     }
 

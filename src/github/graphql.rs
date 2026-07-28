@@ -416,7 +416,8 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         _ => None,
     };
 
-    let (review_requests, team_review_requests) = parse_review_requests(&pr["reviewRequests"]["nodes"]);
+    let (review_requests, team_review_requests) =
+        parse_review_requests(&pr["reviewRequests"]["nodes"]);
 
     let viewer_latest_review = pr["viewerLatestReview"]["state"].as_str().map(String::from);
 
@@ -1193,7 +1194,10 @@ mod tests {
         assert_eq!(pr.review_requests, vec!["bob"]);
         assert_eq!(pr.team_review_requests, vec!["myorg/team-a"]);
         assert_eq!(pr.timeline.len(), 1);
-        assert_eq!(pr.timeline[0].event_type, TimelineEventType::ReviewRequested);
+        assert_eq!(
+            pr.timeline[0].event_type,
+            TimelineEventType::ReviewRequested
+        );
         assert_eq!(pr.timeline[0].detail, "Requested review from myorg/team-a");
     }
 

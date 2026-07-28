@@ -107,7 +107,10 @@ impl RootLayout {
         fill(f, area, BASE);
         // The rules occupy the single rows directly under the tab line and under
         // the body, bracketing the full-bleed active blade.
-        render_rule(f, Rect::new(area.x, layout.tab_line.bottom(), area.width, 1));
+        render_rule(
+            f,
+            Rect::new(area.x, layout.tab_line.bottom(), area.width, 1),
+        );
         render_rule(f, Rect::new(area.x, layout.body.bottom(), area.width, 1));
         layout
     }

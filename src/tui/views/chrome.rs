@@ -43,10 +43,7 @@ pub fn render_tab_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     }
 
     let (meta_spans, meta_width) = tab_meta_spans(ctx.state);
-    let gap = area
-        .width
-        .saturating_sub((used + meta_width) as u16)
-        .max(1) as usize;
+    let gap = area.width.saturating_sub((used + meta_width) as u16).max(1) as usize;
     spans.push(Span::styled(" ".repeat(gap), Style::default().bg(BASE)));
     spans.extend(meta_spans);
 

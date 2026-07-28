@@ -210,9 +210,9 @@ pub fn state_color(group: PrGroup) -> Color {
     match group {
         PrGroup::ReviewNeeded | PrGroup::ReviewUpdate | PrGroup::ReviewDone => OPEN,
         PrGroup::Draft => DRAFT,
-        PrGroup::AuthoredActionNeeded | PrGroup::AuthoredReadyToMerge | PrGroup::AuthoredWaiting => {
-            OPEN
-        }
+        PrGroup::AuthoredActionNeeded
+        | PrGroup::AuthoredReadyToMerge
+        | PrGroup::AuthoredWaiting => OPEN,
         PrGroup::Other => REVIEW_REQUESTED,
     }
 }

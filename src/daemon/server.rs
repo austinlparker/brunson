@@ -889,7 +889,9 @@ mod tests {
             gh_client: Arc::new(tokio::sync::RwLock::new(None)),
             setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
             auth: Box::new(crate::daemon::setup_status::SetupAuthImpl),
-            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            llm_cache: Arc::new(tokio::sync::RwLock::new(
+                crate::llm::LlmClassificationCache::default(),
+            )),
             shutdown: CancellationToken::new(),
             binary_mtime: Some(1),
         })
@@ -1335,7 +1337,9 @@ mod tests {
                 fail_token: false,
                 fail_login: false,
             }),
-            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            llm_cache: Arc::new(tokio::sync::RwLock::new(
+                crate::llm::LlmClassificationCache::default(),
+            )),
             shutdown: CancellationToken::new(),
             binary_mtime: Some(1),
         })
@@ -1361,7 +1365,9 @@ mod tests {
             gh_client: Arc::new(tokio::sync::RwLock::new(None)),
             setup_cache: Arc::new(tokio::sync::RwLock::new(SetupCache::default())),
             auth,
-            llm_cache: Arc::new(tokio::sync::RwLock::new(crate::llm::LlmClassificationCache::default())),
+            llm_cache: Arc::new(tokio::sync::RwLock::new(
+                crate::llm::LlmClassificationCache::default(),
+            )),
             shutdown: CancellationToken::new(),
             binary_mtime: Some(1),
         })

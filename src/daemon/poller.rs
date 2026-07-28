@@ -153,10 +153,9 @@ async fn run_poll_cycle(
             for page in 1..=5u32 {
                 match client.search_prs(&query.query, page).await {
                     Ok(resp) => {
-                        let results = resp
-                            .to_results()
-                            .into_iter()
-                            .map(|result| ProvenancedSearchResult::new(result, query.reason.clone()));
+                        let results = resp.to_results().into_iter().map(|result| {
+                            ProvenancedSearchResult::new(result, query.reason.clone())
+                        });
                         all_results.extend(results);
                         if resp.items.len() < 100 {
                             break;
@@ -276,7 +275,10 @@ async fn run_poll_cycle(
         // which is fine for a best-effort disk cache.
         let snapshot = { llm_cache.read().await.clone() };
         if let Err(e) = snapshot.flush().await {
-            warn!("Failed to persist LLM cache after pruning stale entries: {}", e);
+            warn!(
+                "Failed to persist LLM cache after pruning stale entries: {}",
+                e
+            );
         }
     }
 
@@ -427,7 +429,8 @@ mod tests {
             },
         )];
 
-        let filtered = filter_poll_snapshot(vec![stale], &provenance, &config, "me", &HashSet::new());
+        let filtered =
+            filter_poll_snapshot(vec![stale], &provenance, &config, "me", &HashSet::new());
         assert!(filtered.is_empty());
         store.update_prs(filtered);
 

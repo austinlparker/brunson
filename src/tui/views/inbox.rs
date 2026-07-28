@@ -56,8 +56,8 @@ pub fn render_inbox(f: &mut Frame, area: Rect, ctx: &RenderContext) {
 
     // Header (non-scrolling): column titles aligned to the data columns, plus a
     // right-aligned filter chip when a filter is active.
-    let header = Paragraph::new(header_line(filter, shown, total, &cols))
-        .style(Style::default().bg(BASE));
+    let header =
+        Paragraph::new(header_line(filter, shown, total, &cols)).style(Style::default().bg(BASE));
     f.render_widget(header, chunks[0]);
 
     // Build display rows straight from `inbox_rows`: section headers + per-PR
@@ -83,7 +83,13 @@ pub fn render_inbox(f: &mut Frame, area: Rect, ctx: &RenderContext) {
             }
             InboxRow::Pr { id } => {
                 if let Some(&pr) = by_id.get(id.as_str()) {
-                    lines.push(pr_row_line(pr, current_user, is_selected, &cols, body.width));
+                    lines.push(pr_row_line(
+                        pr,
+                        current_user,
+                        is_selected,
+                        &cols,
+                        body.width,
+                    ));
                 }
             }
         }
@@ -189,8 +195,8 @@ fn header_line(filter: &str, shown: usize, total: usize, cols: &ColumnLayout) ->
     // first column label — appended after the labels it would land past the
     // row width and be clipped.
     let after_title = (cols.title_x + cols.title_width) as usize;
-    let chip = (!filter.is_empty())
-        .then(|| format!("/ {} · {} of {} · / clear", filter, shown, total));
+    let chip =
+        (!filter.is_empty()).then(|| format!("/ {} · {} of {} · / clear", filter, shown, total));
     match chip {
         Some(chip) if chip.chars().count() < after_title => {
             let pad = after_title - chip.chars().count() - 1;
@@ -226,7 +232,6 @@ fn header_line(filter: &str, shown: usize, total: usize, cols: &ColumnLayout) ->
     spans.push(Span::styled(" ", base_bg));
     spans.push(pad_span("AGE", 4, label_style));
 
-
     Line::from(spans)
 }
 
@@ -250,7 +255,10 @@ fn section_line(
         Span::styled(marker, Style::default().fg(accent).bg(bg)),
         Span::styled(
             label_span,
-            Style::default().fg(accent).bg(bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(accent)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default().bg(bg)),
         Span::styled("─".repeat(rule_len), Style::default().fg(SURFACE0).bg(bg)),
@@ -319,7 +327,11 @@ fn pr_row_line(
         } else {
             format!("@{}", pr.author)
         };
-        spans.push(pad_span(&author, aw, Style::default().fg(OVERLAY0).bg(row_bg)));
+        spans.push(pad_span(
+            &author,
+            aw,
+            Style::default().fg(OVERLAY0).bg(row_bg),
+        ));
     }
 
     // checks (mandatory)

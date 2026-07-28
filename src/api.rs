@@ -383,7 +383,10 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".into(),
         };
         let value = serde_json::to_value(&resp).unwrap();
-        assert!(value["groups"].as_object().unwrap().contains_key("review_needed"));
+        assert!(value["groups"]
+            .as_object()
+            .unwrap()
+            .contains_key("review_needed"));
     }
 
     #[test]

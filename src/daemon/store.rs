@@ -100,7 +100,11 @@ impl PrStore {
         // PRs with identical timestamps don't reorder between polls due to
         // HashMap iteration order.
         for prs in groups.values_mut() {
-            prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.slug().cmp(&b.slug())));
+            prs.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.slug().cmp(&b.slug()))
+            });
         }
 
         groups

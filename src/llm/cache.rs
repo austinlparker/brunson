@@ -59,8 +59,7 @@ impl LlmClassificationCache {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create LLM cache dir {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(self)
-            .context("Failed to serialize LLM cache")?;
+        let text = serde_json::to_string_pretty(self).context("Failed to serialize LLM cache")?;
         std::fs::write(&path, text)
             .with_context(|| format!("Failed to write LLM cache to {}", path.display()))?;
         Ok(())

@@ -852,7 +852,12 @@ mod tests {
             PrGroup::ReviewNeeded,
             vec![
                 make_summary("o~r~a", PrGroup::ReviewNeeded, "other", Some(Priority::Low)),
-                make_summary("o~r~b", PrGroup::ReviewNeeded, "other", Some(Priority::High)),
+                make_summary(
+                    "o~r~b",
+                    PrGroup::ReviewNeeded,
+                    "other",
+                    Some(Priority::High),
+                ),
             ],
         );
         let mut app = make_test_state(groups);
@@ -998,7 +1003,15 @@ mod tests {
 
         let dep_header = rows
             .iter()
-            .find(|r| matches!(r, InboxRow::Header { section: InboxSection::Dependencies, .. }))
+            .find(|r| {
+                matches!(
+                    r,
+                    InboxRow::Header {
+                        section: InboxSection::Dependencies,
+                        ..
+                    }
+                )
+            })
             .unwrap();
         assert_eq!(
             *dep_header,
@@ -1099,7 +1112,9 @@ mod tests {
             groups.insert(
                 PrGroup::AuthoredWaiting,
                 (0..opened_count)
-                    .map(|i| make_summary(&format!("o~o~{i}"), PrGroup::AuthoredWaiting, "me", None))
+                    .map(|i| {
+                        make_summary(&format!("o~o~{i}"), PrGroup::AuthoredWaiting, "me", None)
+                    })
                     .collect(),
             );
         }
@@ -1107,7 +1122,9 @@ mod tests {
             groups.insert(
                 PrGroup::ReviewNeeded,
                 (0..review_count)
-                    .map(|i| make_summary(&format!("r~r~{i}"), PrGroup::ReviewNeeded, "other", None))
+                    .map(|i| {
+                        make_summary(&format!("r~r~{i}"), PrGroup::ReviewNeeded, "other", None)
+                    })
                     .collect(),
             );
         }

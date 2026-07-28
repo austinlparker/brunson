@@ -95,7 +95,11 @@ impl RenderCache {
     /// Rebuild activity cache if `detail`'s identity or `width` changed.
     pub fn rebuild_activity(&mut self, detail: Option<&PrDetailResponse>, width: u16) {
         let (id, updated_at) = detail_identity(detail);
-        let key = ActivityKey { id, updated_at, width };
+        let key = ActivityKey {
+            id,
+            updated_at,
+            width,
+        };
         if self.activity_key.as_ref() == Some(&key) {
             return;
         }
@@ -175,10 +179,7 @@ impl RenderCache {
     }
 }
 
-fn build_activity_lines(
-    detail: Option<&PrDetailResponse>,
-    width: usize,
-) -> Vec<Line<'static>> {
+fn build_activity_lines(detail: Option<&PrDetailResponse>, width: usize) -> Vec<Line<'static>> {
     let Some(d) = detail else {
         return vec![Line::from("No activity")];
     };
@@ -244,10 +245,7 @@ use super::theme::{OVERLAY0, SUBTEXT0};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
 
-fn build_summary_lines(
-    detail: Option<&PrDetailResponse>,
-    width: usize,
-) -> Vec<Line<'static>> {
+fn build_summary_lines(detail: Option<&PrDetailResponse>, width: usize) -> Vec<Line<'static>> {
     let Some(d) = detail else { return Vec::new() };
 
     // Prefer the richer catch-up / next-steps summary if available.
@@ -454,7 +452,12 @@ mod tests {
         let mut cache = RenderCache::new();
         cache.rebuild_activity(Some(&detail), 80);
         cache.rebuild_overview(Some(&detail), 80);
-        cache.rebuild_diff(Some(&detail), Some("diff --git a/f b/f\n@@ -1 +1 @@\n+x\n"), 80, false);
+        cache.rebuild_diff(
+            Some(&detail),
+            Some("diff --git a/f b/f\n@@ -1 +1 @@\n+x\n"),
+            80,
+            false,
+        );
 
         // Mutate the cached output directly; if a rebuild with an identical
         // key were to run again it would overwrite this sentinel.
@@ -464,12 +467,23 @@ mod tests {
 
         cache.rebuild_activity(Some(&detail), 80);
         cache.rebuild_overview(Some(&detail), 80);
-        cache.rebuild_diff(Some(&detail), Some("diff --git a/f b/f\n@@ -1 +1 @@\n+x\n"), 80, false);
+        cache.rebuild_diff(
+            Some(&detail),
+            Some("diff --git a/f b/f\n@@ -1 +1 @@\n+x\n"),
+            80,
+            false,
+        );
 
         assert_eq!(cache.activity_lines.len(), 1);
-        assert_eq!(cache.activity_lines[0].spans[0].content, "sentinel-activity");
+        assert_eq!(
+            cache.activity_lines[0].spans[0].content,
+            "sentinel-activity"
+        );
         assert_eq!(cache.overview_summary.len(), 1);
-        assert_eq!(cache.overview_summary[0].spans[0].content, "sentinel-overview");
+        assert_eq!(
+            cache.overview_summary[0].spans[0].content,
+            "sentinel-overview"
+        );
         assert_eq!(cache.diff_lines.len(), 1);
         assert_eq!(cache.diff_lines[0].spans[0].content, "sentinel-diff");
     }

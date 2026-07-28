@@ -167,12 +167,7 @@ impl Classifier {
         }
 
         // Recent timeline events
-        let recent_events: Vec<_> = pr
-            .timeline
-            .iter()
-            .rev()
-            .take(10)
-            .collect();
+        let recent_events: Vec<_> = pr.timeline.iter().rev().take(10).collect();
         if !recent_events.is_empty() {
             content.push_str("Recent activity:\n");
             for event in recent_events {
@@ -571,7 +566,10 @@ struct BatchClassificationItem {
 fn parse_batch_classification(text: &str, expected: usize) -> Vec<ClassificationResult> {
     let objects = extract_json_objects(text);
     if objects.is_empty() {
-        warn!("No JSON objects found in batch classification response: {}", text);
+        warn!(
+            "No JSON objects found in batch classification response: {}",
+            text
+        );
         return (0..expected).map(|_| fallback_classification()).collect();
     }
 
@@ -595,14 +593,20 @@ fn parse_batch_classification(text: &str, expected: usize) -> Vec<Classification
                         results[idx - 1] = Some(result);
                     }
                     Some(idx) => {
-                        warn!("Batch classification item has out-of-range index {}: {}", idx, obj);
+                        warn!(
+                            "Batch classification item has out-of-range index {}: {}",
+                            idx, obj
+                        );
                         unindexed.push(result);
                     }
                     None => unindexed.push(result),
                 }
             }
             Err(e) => {
-                warn!("Failed to parse batch classification item: {} (text: {})", e, obj);
+                warn!(
+                    "Failed to parse batch classification item: {} (text: {})",
+                    e, obj
+                );
             }
         }
     }

@@ -188,7 +188,8 @@ fn file_line(
     ];
 
     // Path (flex, truncated to the path column width)
-    let path = crate::tui::views::text::truncate_to_display_width(&file.path, cols.path_width as usize);
+    let path =
+        crate::tui::views::text::truncate_to_display_width(&file.path, cols.path_width as usize);
     spans.push(pad_span(
         &path,
         cols.path_width,
