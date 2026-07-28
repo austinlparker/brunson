@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
@@ -49,8 +50,61 @@ pub enum StartupPhase {
     Ready,
 }
 
-/// Central TUI application state. This struct holds domain and cache data only —
-/// all transient view/scrolling state lives in `ViewStateManager`.
+fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[("clip", &[])];
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    let mut last_error = None;
+    for (program, args) in candidates {
+        let mut child = match Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                last_error = Some(format!("could not start {program}: {error}"));
+                continue;
+            }
+        };
+
+        let Some(mut stdin) = child.stdin.take() else {
+            last_error = Some(format!("could not open {program} input"));
+            continue;
+        };
+        if let Err(error) = stdin.write_all(text.as_bytes()) {
+            last_error = Some(format!("could not write to {program}: {error}"));
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        drop(stdin);
+
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                last_error = Some(format!("{program} exited with {status}"));
+            }
+            Err(error) => {
+                last_error = Some(format!("could not wait for {program}: {error}"));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "no supported clipboard utility was found".to_string()))
+}
+
 pub struct AppState {
     pub config: Config,
     pub client: DaemonClient,
@@ -452,6 +506,31 @@ impl AppState {
         }
     }
 
+    /// Copy the selected PR's source branch to the system clipboard.
+    fn copy_selected_branch(&mut self) {
+        let Some(branch) = self
+            .pr_detail
+            .as_ref()
+            .map(|detail| detail.head_ref.trim().to_string())
+            .filter(|branch| !branch.is_empty())
+        else {
+            self.error_message = Some(
+                "Copy branch failed: PR details are still loading or no branch is available"
+                    .to_string(),
+            );
+            return;
+        };
+
+        match copy_to_clipboard(&branch) {
+            Ok(()) => {
+                self.error_message = Some(format!("Copied branch: {branch}"));
+            }
+            Err(error) => {
+                self.error_message = Some(format!("Copy branch failed: {error}"));
+            }
+        }
+    }
+
     /// Handle a key event.
     pub fn handle_key(&mut self, view: &mut ViewStateManager, key: KeyEvent) -> Action {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -649,6 +728,7 @@ impl AppState {
         match key.code {
             KeyCode::Char('d') => self.half_page(view, 1),
             KeyCode::Char('u') => self.half_page(view, -1),
+            KeyCode::Char('y') => self.copy_selected_branch(),
             _ => {}
         }
         Action::None
@@ -2489,6 +2569,23 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
+    }
+
+    #[test]
+    fn ctrl_y_without_detail_reports_a_copy_error() {
+        let mut state = make_test_state(HashMap::new());
+        let mut view = ViewStateManager::new();
+
+        let action = state.handle_key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(action, Action::None);
+        assert!(state
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.starts_with("Copy branch failed:")));
     }
 
     #[test]

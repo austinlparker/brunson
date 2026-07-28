@@ -265,6 +265,7 @@ fn blade_keys(blade: Blade) -> &'static [(&'static str, &'static str)] {
             ("⏎", "open"),
             ("/", "filter"),
             ("o", "browser"),
+            ("^y", "copy branch"),
             ("r", "refresh"),
             ("c", "config"),
             ("?", "help"),

@@ -70,6 +70,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("c", "config"),
         ("w", "setup wizard"),
         ("o", "open in browser"),
+        ("^y", "copy selected branch"),
         ("/", "filter inbox"),
         ("1–5", "jump to blade"),
         ("← → / h l", "move between blades"),
