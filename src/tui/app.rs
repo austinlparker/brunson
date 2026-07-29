@@ -2215,7 +2215,7 @@ mod tests {
             viewer_latest_review: None,
             latest_reviews: vec![],
             check_status: CheckStatus::Pending,
-            checks: vec![crate::api::CheckEntryDto {
+            checks: vec![crate::github::types::CheckEntry {
                 name: "ci".to_string(),
                 status: "IN_PROGRESS".to_string(),
                 conclusion: None,
@@ -2223,13 +2223,13 @@ mod tests {
             }],
             review_threads: vec![],
             files: vec![
-                crate::api::FileDto {
+                crate::github::types::PrFile {
                     path: "src/main.rs".to_string(),
                     additions: 1290,
                     deletions: 34,
                     status: 'M',
                 },
-                crate::api::FileDto {
+                crate::github::types::PrFile {
                     path: "terraform/refinery-as-a-service/us1/_griztest-poc.tf".to_string(),
                     additions: 18,
                     deletions: 0,
@@ -2430,7 +2430,7 @@ mod tests {
             checks: vec![],
             review_threads: vec![],
             files: (0..30)
-                .map(|i| crate::api::FileDto {
+                .map(|i| crate::github::types::PrFile {
                     path: format!("src/file_{:02}.rs", i),
                     additions: i as u64,
                     deletions: 1,

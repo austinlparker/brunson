@@ -217,66 +217,12 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
         review_requests: pr.review_requests.clone(),
         team_review_requests: pr.team_review_requests.clone(),
         viewer_latest_review: pr.viewer_latest_review.clone(),
-        latest_reviews: pr
-            .latest_reviews
-            .iter()
-            .map(|r| LatestReviewDto {
-                author: r.author.clone(),
-                state: r.state.clone(),
-            })
-            .collect(),
+        latest_reviews: pr.latest_reviews.clone(),
         check_status: pr.check_status,
-        checks: pr
-            .checks
-            .iter()
-            .map(|c| CheckEntryDto {
-                name: c.name.clone(),
-                status: c.status.clone(),
-                conclusion: c.conclusion.clone(),
-                url: c.url.clone(),
-            })
-            .collect(),
-        review_threads: pr
-            .review_threads
-            .iter()
-            .map(|t| ReviewThreadDto {
-                is_resolved: t.is_resolved,
-                is_outdated: t.is_outdated,
-                comments: t
-                    .comments
-                    .iter()
-                    .map(|c| ReviewCommentDto {
-                        author: c.author.clone(),
-                        body: c.body.clone(),
-                        path: c.path.clone(),
-                        line: c.line,
-                        created_at: c.created_at.clone(),
-                        url: c.url.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        files: pr
-            .files
-            .iter()
-            .map(|f| FileDto {
-                path: f.path.clone(),
-                additions: f.additions,
-                deletions: f.deletions,
-                status: f.status,
-            })
-            .collect(),
-        timeline: pr
-            .timeline
-            .iter()
-            .map(|e| TimelineEventDto {
-                event_type: e.event_type.clone(),
-                actor: e.actor.clone(),
-                created_at: e.created_at.clone(),
-                detail: e.detail.clone(),
-                url: e.url.clone(),
-            })
-            .collect(),
+        checks: pr.checks.clone(),
+        review_threads: pr.review_threads.clone(),
+        files: pr.files.clone(),
+        timeline: pr.timeline.clone(),
         llm_priority: pr.llm_priority,
         llm_summary: pr.llm_summary.clone(),
         llm_rich_summary: pr.llm_rich_summary.clone(),

@@ -1528,7 +1528,7 @@ mod tests {
             review_threads: vec![],
             files: vec![],
             timeline: (0..n)
-                .map(|i| crate::api::TimelineEventDto {
+                .map(|i| crate::github::types::TimelineEvent {
                     event_type: crate::github::types::TimelineEventType::Comment,
                     actor: format!("user{i}"),
                     created_at: format!("2024-01-01T00:00:{:02}Z", i % 60),

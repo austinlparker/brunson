@@ -145,7 +145,7 @@ fn header_line(
 
 fn file_line(
     d: &crate::api::PrDetailResponse,
-    file: &crate::api::FileDto,
+    file: &crate::github::types::PrFile,
     selected: bool,
     cols: &FileColumnLayout,
     width: u16,

@@ -167,10 +167,10 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
 /// 3.  If no exact match, attach to the nearest hunk header line in the same file and mark the
 ///     comment text with `(outdated)`.
 pub fn map_review_threads_to_diff_indices(
-    threads: &[crate::api::ReviewThreadDto],
+    threads: &[crate::github::types::ReviewThread],
     parsed_lines: &[ParsedDiffLine],
-) -> std::collections::HashMap<usize, Vec<crate::api::ReviewCommentDto>> {
-    let mut map: std::collections::HashMap<usize, Vec<crate::api::ReviewCommentDto>> =
+) -> std::collections::HashMap<usize, Vec<crate::github::types::ReviewComment>> {
+    let mut map: std::collections::HashMap<usize, Vec<crate::github::types::ReviewComment>> =
         std::collections::HashMap::new();
 
     for thread in threads {
@@ -232,7 +232,7 @@ fn find_first_hunk_for_file(lines: &[ParsedDiffLine], path: &str) -> Option<usiz
     })
 }
 
-fn outdated_comment(comment: &crate::api::ReviewCommentDto) -> crate::api::ReviewCommentDto {
+fn outdated_comment(comment: &crate::github::types::ReviewComment) -> crate::github::types::ReviewComment {
     let mut c = comment.clone();
     c.body = format!("[outdated] {}", c.body);
     c
@@ -305,7 +305,7 @@ pub fn find_file_boundaries(lines: &[ParsedDiffLine]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{ReviewCommentDto, ReviewThreadDto};
+    use crate::github::types::{ReviewComment, ReviewThread};
 
     const SAMPLE_DIFF: &str = r#"diff --git a/src/main.rs b/src/main.rs
 index abc123..def456 100644
@@ -469,10 +469,10 @@ diff --git a/b.rs b/b.rs
 "#;
         let lines = parse_diff(diff);
         let threads = vec![
-            ReviewThreadDto {
+            ReviewThread {
                 is_resolved: false,
                 is_outdated: false,
-                comments: vec![ReviewCommentDto {
+                comments: vec![ReviewComment {
                     author: "alice".into(),
                     body: "comment in a".into(),
                     path: "a.rs".into(),
@@ -481,10 +481,10 @@ diff --git a/b.rs b/b.rs
                     url: String::new(),
                 }],
             },
-            ReviewThreadDto {
+            ReviewThread {
                 is_resolved: false,
                 is_outdated: false,
-                comments: vec![ReviewCommentDto {
+                comments: vec![ReviewComment {
                     author: "bob".into(),
                     body: "comment in b".into(),
                     path: "b.rs".into(),
@@ -519,10 +519,10 @@ diff --git a/b.rs b/b.rs
 +modified
 "#;
         let lines = parse_diff(diff);
-        let threads = vec![ReviewThreadDto {
+        let threads = vec![ReviewThread {
             is_resolved: false,
             is_outdated: true,
-            comments: vec![ReviewCommentDto {
+            comments: vec![ReviewComment {
                 author: "alice".into(),
                 body: "needs fix".into(),
                 path: "a.rs".into(),

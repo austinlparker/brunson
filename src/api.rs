@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::github::types::{
-    CheckStatus, MergeableState, PrGroup, Priority, ReviewDecision, TimelineEventType,
+    CheckEntry, CheckStatus, LatestReview, MergeableState, PrFile, PrGroup, Priority,
+    ReviewDecision, ReviewThread, TimelineEvent,
 };
 
 fn default_setup_status() -> String {
@@ -203,78 +204,18 @@ pub struct PrDetailResponse {
     #[serde(default)]
     pub team_review_requests: Vec<String>,
     pub viewer_latest_review: Option<String>,
-    pub latest_reviews: Vec<LatestReviewDto>,
+    pub latest_reviews: Vec<LatestReview>,
     pub check_status: CheckStatus,
-    pub checks: Vec<CheckEntryDto>,
-    pub review_threads: Vec<ReviewThreadDto>,
-    pub files: Vec<FileDto>,
-    pub timeline: Vec<TimelineEventDto>,
+    pub checks: Vec<CheckEntry>,
+    pub review_threads: Vec<ReviewThread>,
+    pub files: Vec<PrFile>,
+    pub timeline: Vec<TimelineEvent>,
     pub llm_priority: Option<Priority>,
     pub llm_summary: Option<String>,
     #[serde(default)]
     pub llm_rich_summary: Option<crate::github::types::LlmRichSummary>,
     #[serde(default)]
     pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LatestReviewDto {
-    pub author: String,
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckEntryDto {
-    pub name: String,
-    pub status: String,
-    pub conclusion: Option<String>,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewThreadDto {
-    pub is_resolved: bool,
-    pub is_outdated: bool,
-    pub comments: Vec<ReviewCommentDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewCommentDto {
-    pub author: String,
-    pub body: String,
-    pub path: String,
-    pub line: Option<i64>,
-    /// ISO 8601 timestamp; empty when talking to an older daemon.
-    #[serde(default)]
-    pub created_at: String,
-    /// Web URL of the comment; empty when talking to an older daemon.
-    #[serde(default)]
-    pub url: String,
-}
-
-fn default_file_status() -> char {
-    '?'
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileDto {
-    pub path: String,
-    pub additions: u64,
-    pub deletions: u64,
-    #[serde(default = "default_file_status")]
-    pub status: char,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimelineEventDto {
-    pub event_type: TimelineEventType,
-    pub actor: String,
-    pub created_at: String,
-    pub detail: String,
-    /// Web URL of the event (comments/reviews only); empty when talking to
-    /// an older daemon or for event types with no stable URL.
-    #[serde(default)]
-    pub url: String,
 }
 
 /// GET /prs/{id}/diff
@@ -333,6 +274,7 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::types::ReviewComment;
 
     /// A `PrSummary` payload as an old daemon (before `author_is_bot`,
     /// `comments`, `head_ref`, and `llm_one_line` existed) would emit it.
@@ -410,16 +352,156 @@ mod tests {
         assert_eq!(summary.llm_one_line, None);
 
         let json = r#"{"author":"bob","body":"fix","path":"src/main.rs","line":3}"#;
-        let comment: ReviewCommentDto = serde_json::from_str(json).expect("deserializes");
+        let comment: ReviewComment = serde_json::from_str(json).expect("deserializes");
         assert_eq!(comment.created_at, "");
         assert_eq!(comment.url, "");
 
         let json = r#"{"event_type":"comment","actor":"bob","created_at":"2024-01-01T00:00:00Z","detail":"hi"}"#;
-        let event: TimelineEventDto = serde_json::from_str(json).expect("deserializes");
+        let event: TimelineEvent = serde_json::from_str(json).expect("deserializes");
         assert_eq!(event.url, "");
 
         let json = r#"{"path": "src/main.rs", "additions": 10, "deletions": 2}"#;
-        let file: FileDto = serde_json::from_str(json).expect("deserializes");
+        let file: PrFile = serde_json::from_str(json).expect("deserializes");
         assert_eq!(file.status, '?');
+    }
+
+    fn fully_populated_detail() -> PrDetailResponse {
+        PrDetailResponse {
+            id: "org~repo~42".into(),
+            node_id: "PR_node42".into(),
+            owner: "org".into(),
+            repo: "repo".into(),
+            number: 42,
+            title: "Add feature X".into(),
+            body: "## Summary\nDoes X.".into(),
+            url: "https://github.com/org/repo/pull/42".into(),
+            author: "alice".into(),
+            is_draft: true,
+            updated_at: "2024-06-24T12:00:00Z".into(),
+            head_ref: "feature/x".into(),
+            base_ref: "main".into(),
+            mergeable: MergeableState::Conflicting,
+            review_decision: Some(ReviewDecision::ChangesRequested),
+            review_requests: vec!["bob".into()],
+            team_review_requests: vec!["org/team-a".into()],
+            viewer_latest_review: Some("APPROVED".into()),
+            latest_reviews: vec![LatestReview {
+                author: "carol".into(),
+                state: "CHANGES_REQUESTED".into(),
+            }],
+            check_status: CheckStatus::Failure,
+            checks: vec![CheckEntry {
+                name: "ci/build".into(),
+                status: "COMPLETED".into(),
+                conclusion: Some("FAILURE".into()),
+                url: "https://ci.example.com/run/1".into(),
+            }],
+            review_threads: vec![ReviewThread {
+                is_resolved: false,
+                is_outdated: true,
+                comments: vec![ReviewComment {
+                    author: "carol".into(),
+                    body: "Please fix".into(),
+                    path: "src/main.rs".into(),
+                    line: Some(12),
+                    created_at: "2024-06-24T11:00:00Z".into(),
+                    url: "https://github.com/org/repo/pull/42#discussion_r1".into(),
+                }],
+            }],
+            files: vec![PrFile {
+                path: "src/main.rs".into(),
+                additions: 10,
+                deletions: 2,
+                status: 'M',
+            }],
+            timeline: vec![TimelineEvent {
+                event_type: crate::github::types::TimelineEventType::Review,
+                actor: "carol".into(),
+                created_at: "2024-06-24T11:00:00Z".into(),
+                detail: "changes_requested: Please fix".into(),
+                url: "https://github.com/org/repo/pull/42#pullrequestreview-1".into(),
+            }],
+            llm_priority: Some(Priority::High),
+            llm_summary: Some("Feature X implementation".into()),
+            llm_rich_summary: Some(crate::github::types::LlmRichSummary {
+                one_line: "Adds X".into(),
+                catch_up: "Carol requested changes".into(),
+                next_steps: "Fix review comments".into(),
+                generated_at: chrono::DateTime::parse_from_rfc3339("2024-06-24T12:30:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+                prompt_version: 2,
+            }),
+            last_seen_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2024-06-24T10:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+        }
+    }
+
+    // Wire-format guard for the DTO→domain-type consolidation: the golden
+    // fixture was captured from the pre-consolidation `*Dto` serialization,
+    // so this proves `PrDetailResponse` still serializes byte-identically
+    // (field names, enum tokens, defaults) after embedding the domain types.
+    #[test]
+    fn pr_detail_response_wire_format_is_unchanged() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/pr_detail_golden.json"))
+                .expect("golden fixture parses");
+        let actual = serde_json::to_value(fully_populated_detail()).unwrap();
+        assert_eq!(actual, golden);
+    }
+
+    // Version-skew guard: a payload from an older daemon that predates every
+    // compatibility-defaulted field (review-comment created_at/url, file
+    // status, timeline url, top-level team_review_requests /
+    // llm_rich_summary / last_seen_at) must still deserialize.
+    #[test]
+    fn pr_detail_response_tolerates_old_daemon_payload() {
+        let json = r#"{
+            "id": "org~repo~1",
+            "node_id": "n1",
+            "owner": "org",
+            "repo": "repo",
+            "number": 1,
+            "title": "T",
+            "body": "",
+            "url": "https://example.com",
+            "author": "a",
+            "is_draft": false,
+            "updated_at": "2024-01-01T00:00:00Z",
+            "head_ref": "feature",
+            "base_ref": "main",
+            "mergeable": "MERGEABLE",
+            "review_decision": null,
+            "review_requests": [],
+            "viewer_latest_review": null,
+            "latest_reviews": [],
+            "check_status": "none",
+            "checks": [],
+            "review_threads": [{
+                "is_resolved": false,
+                "is_outdated": false,
+                "comments": [{"author":"bob","body":"fix","path":"src/main.rs","line":3}]
+            }],
+            "files": [{"path": "src/main.rs", "additions": 1, "deletions": 0}],
+            "timeline": [{
+                "event_type": "comment",
+                "actor": "bob",
+                "created_at": "2024-01-01T00:00:00Z",
+                "detail": "hi"
+            }],
+            "llm_priority": null,
+            "llm_summary": null
+        }"#;
+        let detail: PrDetailResponse = serde_json::from_str(json).expect("deserializes");
+        assert!(detail.team_review_requests.is_empty());
+        assert!(detail.llm_rich_summary.is_none());
+        assert!(detail.last_seen_at.is_none());
+        assert_eq!(detail.review_threads[0].comments[0].created_at, "");
+        assert_eq!(detail.review_threads[0].comments[0].url, "");
+        assert_eq!(detail.files[0].status, '?');
+        assert_eq!(detail.timeline[0].url, "");
     }
 }

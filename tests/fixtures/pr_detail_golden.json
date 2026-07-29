@@ -1,0 +1,82 @@
+{
+  "author": "alice",
+  "base_ref": "main",
+  "body": "## Summary\nDoes X.",
+  "check_status": "failure",
+  "checks": [
+    {
+      "conclusion": "FAILURE",
+      "name": "ci/build",
+      "status": "COMPLETED",
+      "url": "https://ci.example.com/run/1"
+    }
+  ],
+  "files": [
+    {
+      "additions": 10,
+      "deletions": 2,
+      "path": "src/main.rs",
+      "status": "M"
+    }
+  ],
+  "head_ref": "feature/x",
+  "id": "org~repo~42",
+  "is_draft": true,
+  "last_seen_at": "2024-06-24T10:00:00Z",
+  "latest_reviews": [
+    {
+      "author": "carol",
+      "state": "CHANGES_REQUESTED"
+    }
+  ],
+  "llm_priority": "high",
+  "llm_rich_summary": {
+    "catch_up": "Carol requested changes",
+    "generated_at": "2024-06-24T12:30:00Z",
+    "next_steps": "Fix review comments",
+    "one_line": "Adds X",
+    "prompt_version": 2
+  },
+  "llm_summary": "Feature X implementation",
+  "mergeable": "CONFLICTING",
+  "node_id": "PR_node42",
+  "number": 42,
+  "owner": "org",
+  "repo": "repo",
+  "review_decision": "CHANGES_REQUESTED",
+  "review_requests": [
+    "bob"
+  ],
+  "review_threads": [
+    {
+      "comments": [
+        {
+          "author": "carol",
+          "body": "Please fix",
+          "created_at": "2024-06-24T11:00:00Z",
+          "line": 12,
+          "path": "src/main.rs",
+          "url": "https://github.com/org/repo/pull/42#discussion_r1"
+        }
+      ],
+      "is_outdated": true,
+      "is_resolved": false
+    }
+  ],
+  "team_review_requests": [
+    "org/team-a"
+  ],
+  "timeline": [
+    {
+      "actor": "carol",
+      "created_at": "2024-06-24T11:00:00Z",
+      "detail": "changes_requested: Please fix",
+      "event_type": "review",
+      "url": "https://github.com/org/repo/pull/42#pullrequestreview-1"
+    }
+  ],
+  "title": "Add feature X",
+  "updated_at": "2024-06-24T12:00:00Z",
+  "url": "https://github.com/org/repo/pull/42",
+  "viewer_latest_review": "APPROVED"
+}

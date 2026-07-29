@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::api::ReviewCommentDto;
+use crate::github::types::ReviewComment;
 use crate::diff::render::{DiffLineType, ParsedDiffLine};
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::layout::fill;
@@ -182,7 +182,7 @@ fn line_style(parsed: &ParsedDiffLine) -> Style {
 }
 
 pub(crate) fn render_inline_comments_internal(
-    comments: &[ReviewCommentDto],
+    comments: &[ReviewComment],
     max_width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();

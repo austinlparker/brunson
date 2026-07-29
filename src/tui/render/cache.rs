@@ -1,7 +1,8 @@
 use ratatui::text::Line;
 use std::collections::HashMap;
 
-use crate::api::{PrDetailResponse, ReviewCommentDto};
+use crate::api::PrDetailResponse;
+use crate::github::types::ReviewComment;
 use crate::diff::render::{parse_diff, ParsedDiffLine};
 use crate::tui::views::markdown::markdown_lines;
 
@@ -135,7 +136,7 @@ pub struct RenderCache {
     overview_key: Option<OverviewKey>,
 
     /// Diff comments mapped by line index into the original parsed diff.
-    pub diff_comments: HashMap<usize, Vec<ReviewCommentDto>>,
+    pub diff_comments: HashMap<usize, Vec<ReviewComment>>,
 }
 
 impl RenderCache {
@@ -524,7 +525,7 @@ fn build_diff_lines(
     parsed: &[ParsedDiffLine],
     width: usize,
     show_line_numbers: bool,
-    comments: &HashMap<usize, Vec<ReviewCommentDto>>,
+    comments: &HashMap<usize, Vec<ReviewComment>>,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
     use crate::tui::views::diff::{render_diff_line_internal, render_inline_comments_internal};
 
@@ -710,8 +711,8 @@ mod tests {
         );
     }
 
-    fn timeline_event(actor: &str, created_at: &str, detail: &str) -> crate::api::TimelineEventDto {
-        crate::api::TimelineEventDto {
+    fn timeline_event(actor: &str, created_at: &str, detail: &str) -> crate::github::types::TimelineEvent {
+        crate::github::types::TimelineEvent {
             event_type: crate::github::types::TimelineEventType::Comment,
             actor: actor.to_string(),
             created_at: created_at.to_string(),
@@ -720,8 +721,8 @@ mod tests {
         }
     }
 
-    fn thread_comment(author: &str, body: &str, created_at: &str) -> crate::api::ReviewCommentDto {
-        crate::api::ReviewCommentDto {
+    fn thread_comment(author: &str, body: &str, created_at: &str) -> crate::github::types::ReviewComment {
+        crate::github::types::ReviewComment {
             author: author.to_string(),
             body: body.to_string(),
             path: "src/lib.rs".to_string(),
@@ -739,7 +740,7 @@ mod tests {
             timeline_event("late", "2024-01-03T00:00:00Z", "third comment"),
         ];
         // Thread timestamp lands between the two timeline events.
-        detail.review_threads = vec![crate::api::ReviewThreadDto {
+        detail.review_threads = vec![crate::github::types::ReviewThread {
             is_resolved: false,
             is_outdated: false,
             comments: vec![thread_comment("mid", "thread body", "2024-01-02T00:00:00Z")],
@@ -760,12 +761,12 @@ mod tests {
         detail.timeline = vec![timeline_event("dated", "2024-01-01T00:00:00Z", "hello")];
         // Legacy data: thread comments carry no created_at.
         detail.review_threads = vec![
-            crate::api::ReviewThreadDto {
+            crate::github::types::ReviewThread {
                 is_resolved: false,
                 is_outdated: false,
                 comments: vec![thread_comment("legacy-a", "a", "")],
             },
-            crate::api::ReviewThreadDto {
+            crate::github::types::ReviewThread {
                 is_resolved: false,
                 is_outdated: false,
                 comments: vec![thread_comment("legacy-b", "b", "")],
@@ -794,7 +795,7 @@ mod tests {
     #[test]
     fn activity_thread_event_concatenates_comments_and_marks_resolved() {
         let mut detail = make_detail("org~repo~1", "2024-01-01T00:00:00Z");
-        detail.review_threads = vec![crate::api::ReviewThreadDto {
+        detail.review_threads = vec![crate::github::types::ReviewThread {
             is_resolved: true,
             is_outdated: false,
             comments: vec![
@@ -838,8 +839,8 @@ mod tests {
         );
     }
 
-    fn check(status: &str, conclusion: Option<&str>) -> crate::api::CheckEntryDto {
-        crate::api::CheckEntryDto {
+    fn check(status: &str, conclusion: Option<&str>) -> crate::github::types::CheckEntry {
+        crate::github::types::CheckEntry {
             name: format!("check-{}-{}", status, conclusion.unwrap_or("none")),
             status: status.to_string(),
             conclusion: conclusion.map(String::from),
