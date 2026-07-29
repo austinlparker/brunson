@@ -8,18 +8,10 @@ use tracing::{debug, warn};
 use super::auth::resolve_host;
 use super::types::SearchResult;
 
-/// GitHub API rate limit info extracted from response headers.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct RateLimitInfo {
-    pub remaining: Option<u32>,
-}
-
 /// Wrapper around reqwest::Client with GitHub auth and base URL resolution.
 #[derive(Clone)]
 pub struct GitHubClient {
     client: Client,
-    token: String,
     rest_base: String,
     graphql_base: String,
     rate_limit_remaining: Arc<AtomicU32>,
@@ -48,27 +40,10 @@ impl GitHubClient {
 
         Ok(Self {
             client,
-            token,
             rest_base,
             graphql_base,
             rate_limit_remaining: Arc::new(AtomicU32::new(5000)),
         })
-    }
-
-    /// Returns a reference to the underlying token (for internal use only).
-    #[allow(dead_code)]
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    #[allow(dead_code)]
-    pub fn rest_base(&self) -> &str {
-        &self.rest_base
-    }
-
-    #[allow(dead_code)]
-    pub fn graphql_base(&self) -> &str {
-        &self.graphql_base
     }
 
     pub fn rate_limit_remaining(&self) -> u32 {

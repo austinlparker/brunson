@@ -223,7 +223,7 @@ async fn run_poll_cycle(
         } else {
             fetch_viewer_team_memberships(client, &configured_teams, &current_user).await?
         };
-        Ok(filter_poll_snapshot(
+        Ok(filter_prs_by_provenance(
             prs,
             &provenance,
             &config.github,
@@ -342,22 +342,6 @@ async fn run_poll_cycle(
     Ok(())
 }
 
-fn filter_poll_snapshot(
-    prs: Vec<PullRequest>,
-    provenance: &[ProvenancedSearchResult],
-    github_config: &crate::config::GithubConfig,
-    current_user: &str,
-    current_team_memberships: &HashSet<String>,
-) -> Vec<PullRequest> {
-    filter_prs_by_provenance(
-        prs,
-        provenance,
-        github_config,
-        current_user,
-        current_team_memberships,
-    )
-}
-
 fn llm_classification_candidates<'a>(
     changed_prs: &[PullRequest],
     stored_prs: impl Iterator<Item = &'a PullRequest>,
@@ -430,7 +414,7 @@ mod tests {
         )];
 
         let filtered =
-            filter_poll_snapshot(vec![stale], &provenance, &config, "me", &HashSet::new());
+            filter_prs_by_provenance(vec![stale], &provenance, &config, "me", &HashSet::new());
         assert!(filtered.is_empty());
         store.update_prs(filtered);
 

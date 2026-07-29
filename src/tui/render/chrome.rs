@@ -1,12 +1,12 @@
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::component::{Component, RenderContext};
 use super::layout::fill;
-use super::theme::{BASE, FAIL, MANTLE, PENDING, TEXT};
+use super::theme::{FAIL, MANTLE, PENDING, TEXT};
 
 /// Centered overlay layer that renders `state.error_message` over the body.
 /// The keybar is never replaced by this toast; it is drawn on top of the body
@@ -97,10 +97,3 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-#[allow(dead_code)]
-fn _palette_keepalive() -> Style {
-    Style::default()
-        .fg(BASE)
-        .bg(MANTLE)
-        .add_modifier(Modifier::BOLD)
-}

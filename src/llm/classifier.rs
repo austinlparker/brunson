@@ -11,11 +11,6 @@ use tracing::{debug, warn};
 use crate::config::{default_endpoint_for_provider, LlmConfig};
 use crate::github::types::{Priority, PullRequest};
 
-const SYSTEM_PROMPT: &str = "You are a PR triage assistant. Classify the following pull request's urgency. \
-Consider: is the author blocked waiting on review? Is CI failing? Are there unresolved change requests? \
-Respond ONLY with JSON in this exact format: \
-{\"priority\": \"high|medium|low\", \"summary\": \"one sentence summary\", \"reasoning\": \"brief explanation\"}";
-
 /// Maximum PRs classified in a single batched LLM call. Chunking keeps each
 /// prompt/response a bounded size regardless of how many PRs need
 /// classification in a given poll cycle.
@@ -270,42 +265,9 @@ impl Classifier {
         }
     }
 
-    /// Build the user content for classification from a PR.
-    fn build_pr_content(pr: &PullRequest) -> String {
-        let mut content = format!("Title: {}\n", pr.title);
-        content.push_str(&format!("Author: {}\n", pr.author));
-        content.push_str(&format!("Draft: {}\n", pr.is_draft));
-
-        // Body excerpt
-        let body_excerpt: String = pr.body.chars().take(500).collect();
-        if !body_excerpt.is_empty() {
-            content.push_str(&format!("Body: {}\n", body_excerpt));
-        }
-
-        // Check status
-        content.push_str(&format!("CI Status: {:?}\n", pr.check_status));
-
-        // Review decision
-        if let Some(rd) = &pr.review_decision {
-            content.push_str(&format!("Review Decision: {:?}\n", rd));
-        }
-
-        // Recent comments
-        for thread in pr.review_threads.iter().take(3) {
-            if !thread.is_resolved {
-                if let Some(comment) = thread.comments.first() {
-                    let excerpt: String = comment.body.chars().take(200).collect();
-                    content.push_str(&format!("Comment from {}: {}\n", comment.author, excerpt));
-                }
-            }
-        }
-
-        content
-    }
-
     /// Build the user content listing multiple PRs for a batched
-    /// classification call. Trimmed tighter than `build_pr_content` since
-    /// the excerpt budget now divides across up to `CLASSIFY_BATCH_SIZE` PRs.
+    /// classification call. The excerpt budget divides across up to
+    /// `CLASSIFY_BATCH_SIZE` PRs.
     fn build_batch_pr_content(prs: &[PullRequest]) -> String {
         let mut content = String::new();
         for (i, pr) in prs.iter().enumerate() {
@@ -337,45 +299,6 @@ impl Classifier {
             content.push('\n');
         }
         content
-    }
-
-    /// Classify a PR's urgency via the configured OpenAI-compatible endpoint.
-    pub async fn classify(&self, pr: &PullRequest) -> Result<ClassificationResult> {
-        let content = Self::build_pr_content(pr);
-
-        let request = ChatRequest {
-            model: self.config.model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: SYSTEM_PROMPT.into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content,
-                },
-            ],
-            temperature: 0.0,
-            max_tokens: self.config.max_output_tokens,
-        };
-
-        let url = format!("{}/chat/completions", self.config.endpoint);
-        let resp = self.client.post(&url).json(&request).send().await?;
-
-        if !resp.status().is_success() {
-            return Err(anyhow!("LLM request failed: {}", resp.status()));
-        }
-
-        let chat_resp: ChatResponse = resp.json().await?;
-        let response_text = chat_resp
-            .choices
-            .first()
-            .ok_or_else(|| anyhow!("No choices in LLM response"))?
-            .message
-            .content
-            .clone();
-
-        parse_classification(&response_text)
     }
 
     /// Classify up to `CLASSIFY_BATCH_SIZE` PRs in a single call. Always
@@ -491,52 +414,6 @@ const BATCH_MIN_TOKENS: u32 = 16384;
 fn batch_max_tokens(pr_count: usize, single_item_budget: u32) -> u32 {
     let scaled = BATCH_TOKENS_PER_PR.saturating_mul(pr_count as u32);
     single_item_budget.max(scaled).max(BATCH_MIN_TOKENS)
-}
-
-/// Parse the LLM response text into a ClassificationResult.
-/// Handles malformed JSON gracefully.
-pub fn parse_classification(text: &str) -> Result<ClassificationResult> {
-    // Try to extract JSON from the response
-    let json_str = extract_json(text);
-
-    match json_str {
-        Some(json) => {
-            #[derive(Deserialize)]
-            struct ClassificationJson {
-                priority: String,
-                #[serde(default)]
-                summary: String,
-                #[serde(default)]
-                reasoning: String,
-            }
-
-            match serde_json::from_str::<ClassificationJson>(&json) {
-                Ok(parsed) => {
-                    let priority = match parsed.priority.to_lowercase().as_str() {
-                        "high" => Priority::High,
-                        "low" => Priority::Low,
-                        _ => Priority::Medium,
-                    };
-                    Ok(ClassificationResult {
-                        priority,
-                        summary: parsed.summary,
-                        reasoning: parsed.reasoning,
-                    })
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to parse classification JSON: {} (text: {})",
-                        e, json
-                    );
-                    Ok(fallback_classification())
-                }
-            }
-        }
-        None => {
-            warn!("No JSON found in classification response: {}", text);
-            Ok(fallback_classification())
-        }
-    }
 }
 
 fn fallback_classification() -> ClassificationResult {
@@ -776,47 +653,6 @@ fn extract_json(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_valid_json() {
-        let text =
-            r#"{"priority": "high", "summary": "Blocking issue", "reasoning": "CI failing"}"#;
-        let result = parse_classification(text).unwrap();
-        assert_eq!(result.priority, Priority::High);
-        assert_eq!(result.summary, "Blocking issue");
-    }
-
-    #[test]
-    fn test_parse_with_surrounding_text() {
-        let text = r#"Here is the classification: {"priority": "low", "summary": "Minor docs update", "reasoning": "Low impact"} Done."#;
-        let result = parse_classification(text).unwrap();
-        assert_eq!(result.priority, Priority::Low);
-        assert_eq!(result.summary, "Minor docs update");
-    }
-
-    #[test]
-    fn test_parse_markdown_code_block() {
-        let text = "```json\n{\"priority\": \"medium\", \"summary\": \"Test\"}\n```";
-        let result = parse_classification(text).unwrap();
-        assert_eq!(result.priority, Priority::Medium);
-        assert_eq!(result.summary, "Test");
-    }
-
-    #[test]
-    fn test_parse_malformed_json() {
-        let text = "This is not JSON at all";
-        let result = parse_classification(text).unwrap();
-        assert_eq!(result.priority, Priority::Medium);
-        assert!(result.summary.is_empty());
-    }
-
-    #[test]
-    fn test_parse_truncated_json() {
-        let text = r#"{"priority": "high"#;
-        let result = parse_classification(text).unwrap();
-        // Should fall back to medium
-        assert_eq!(result.priority, Priority::Medium);
-    }
 
     #[test]
     fn test_parse_batch_valid_json() {

@@ -148,11 +148,6 @@ async fn viewer_is_team_member(
 
 const MAX_CONNECTION_PAGES: usize = 20;
 
-/// Build the variable-driven PR detail query.
-pub fn build_pr_detail_query() -> &'static str {
-    PR_DETAIL_QUERY
-}
-
 const PR_DETAIL_QUERY: &str = r#"query(
   $owner: String!,
   $repo: String!,
@@ -341,40 +336,6 @@ const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($threadId: ID!, $after: Stri
     }
   }
 }"#;
-
-/// Parse a GraphQL response into PullRequest structs.
-/// Returns PRs keyed by their GraphQL node ID.
-pub fn parse_batch_response(
-    resp: &serde_json::Value,
-    prs: &[(String, String, u64)],
-) -> Vec<PullRequest> {
-    let data = match resp.get("data") {
-        Some(d) => d,
-        None => {
-            warn!("GraphQL response missing 'data' field");
-            return Vec::new();
-        }
-    };
-
-    let mut results = Vec::new();
-
-    for (i, (owner, repo, number)) in prs.iter().enumerate() {
-        let alias = format!("pr{}", i);
-        let pr_data = &data[&alias]["pullRequest"];
-        if pr_data.is_null() {
-            debug!(
-                "PR {}/{}/{} not found in GraphQL response",
-                owner, repo, number
-            );
-            continue;
-        }
-
-        let pr = parse_single_pr(pr_data, owner, repo);
-        results.push(pr);
-    }
-
-    results
-}
 
 fn parse_pr_response(
     resp: &serde_json::Value,
@@ -1050,14 +1011,6 @@ fn append_thread_comments_page(
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_pr_detail_query_uses_variables_not_string_interpolation() {
-        let query = build_pr_detail_query();
-        assert!(query.contains("$owner: String!"));
-        assert!(query.contains("repository(owner: $owner, name: $repo)"));
-        assert!(!query.contains("repository(owner:\""));
-    }
 
     #[test]
     fn test_append_connection_page_merges_nodes_and_page_info() {

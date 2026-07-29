@@ -302,13 +302,6 @@ pub fn find_file_boundaries(lines: &[ParsedDiffLine]) -> Vec<usize> {
         .collect()
 }
 
-/// Get the file extension from a path for syntax highlighting.
-#[allow(dead_code)]
-pub fn file_extension(path: &str) -> Option<&str> {
-    let path = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
-    path.rsplit_once('.').map(|(_, ext)| ext)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,13 +393,6 @@ index abc123..def456 100644
         let boundaries = find_file_boundaries(&lines);
         assert_eq!(boundaries, vec![0]);
         assert!(lines[0].line_type == DiffLineType::FileHeader);
-    }
-
-    #[test]
-    fn test_file_extension() {
-        assert_eq!(file_extension("src/main.rs"), Some("rs"));
-        assert_eq!(file_extension("lib/types.ts"), Some("ts"));
-        assert_eq!(file_extension("Makefile"), None);
     }
 
     #[test]

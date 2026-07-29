@@ -151,18 +151,6 @@ pub fn build_query_specs(watch: &[String]) -> Vec<SearchQuery> {
     queries
 }
 
-/// Build all search queries for a poll cycle.
-/// Returns a list of query strings.
-///
-/// If `watch` is empty, one query per search type (3 total).
-/// If `watch` has entries, 3 × len(watch) queries.
-pub fn build_queries(watch: &[String]) -> Vec<String> {
-    build_query_specs(watch)
-        .into_iter()
-        .map(|spec| spec.query)
-        .collect()
-}
-
 fn watch_reason(search_type: SearchType, scope: Option<SearchScope>) -> SearchReason {
     match search_type {
         SearchType::ReviewRequested => SearchReason::WatchReviewRequested { scope },
@@ -480,68 +468,9 @@ fn target_allows(
         .any(|target| target_scope(target).as_ref() == Some(scope) && allows(target))
 }
 
-/// Extract owner and repo from a watch entry.
-/// Returns (org_qualifier, repo_qualifier) tuple — only one is populated.
-#[allow(dead_code)]
-pub fn parse_watch_entry(entry: &str) -> (Option<String>, Option<String>) {
-    if entry.contains('/') {
-        (None, Some(format!("repo:{}", entry)))
-    } else {
-        (Some(format!("org:{}", entry)), None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_build_queries_empty_watch() {
-        let queries = build_queries(&[]);
-        assert_eq!(queries.len(), 3);
-        assert!(queries[0].contains("review-requested:@me"));
-        assert!(queries[1].contains("author:@me"));
-        assert!(queries[2].contains("involves:@me"));
-        for q in &queries {
-            assert!(q.contains("is:pr is:open"));
-        }
-    }
-
-    #[test]
-    fn test_build_queries_with_watch() {
-        let watch = vec!["myorg".to_string(), "myorg/repo-a".to_string()];
-        let queries = build_queries(&watch);
-        // 3 search types × 2 watch entries = 6 queries
-        assert_eq!(queries.len(), 6);
-
-        // Should have org:myorg queries
-        assert!(queries.iter().any(|q| q.contains("org:myorg")));
-        // Should have repo:myorg/repo-a queries
-        assert!(queries.iter().any(|q| q.contains("repo:myorg/repo-a")));
-
-        for q in &queries {
-            assert!(q.contains("is:pr is:open"));
-        }
-    }
-
-    #[test]
-    fn test_build_queries_org_vs_repo_qualifier() {
-        let watch = vec!["myorg".to_string()];
-        let queries = build_queries(&watch);
-        assert_eq!(queries.len(), 3);
-        for q in &queries {
-            assert!(q.contains("org:myorg"));
-            assert!(!q.contains("repo:"));
-        }
-
-        let watch = vec!["myorg/repo-b".to_string()];
-        let queries = build_queries(&watch);
-        assert_eq!(queries.len(), 3);
-        for q in &queries {
-            assert!(q.contains("repo:myorg/repo-b"));
-            assert!(!q.contains("org:"));
-        }
-    }
 
     #[test]
     fn test_build_queries_for_config_uses_precise_target_review_requests() {

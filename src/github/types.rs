@@ -30,34 +30,6 @@ pub enum PrGroup {
 }
 
 impl PrGroup {
-    /// Display label for the group header.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::AuthoredActionNeeded => "Action Needed",
-            Self::AuthoredReadyToMerge => "Ready to Merge",
-            Self::AuthoredWaiting => "Waiting",
-            Self::ReviewNeeded => "Review Needed",
-            Self::ReviewUpdate => "Re-Review",
-            Self::ReviewDone => "Reviewed",
-            Self::Draft => "Drafts",
-            Self::Other => "Other",
-        }
-    }
-
-    /// Icon/emoji for the group.
-    pub fn icon(&self) -> &'static str {
-        match self {
-            Self::AuthoredActionNeeded => "🔴",
-            Self::AuthoredReadyToMerge => "✅",
-            Self::AuthoredWaiting => "⏳",
-            Self::ReviewNeeded => "👀",
-            Self::ReviewUpdate => "🔄",
-            Self::ReviewDone => "✓",
-            Self::Draft => "📝",
-            Self::Other => "🔔",
-        }
-    }
-
     /// All groups in display order: authored lane, then review lane, then other.
     pub fn all_in_priority_order() -> &'static [PrGroup] {
         &[
@@ -70,43 +42,6 @@ impl PrGroup {
             Self::Draft,
             Self::Other,
         ]
-    }
-
-    /// Which lane this group belongs to.
-    pub fn lane(&self) -> PrLane {
-        match self {
-            Self::AuthoredActionNeeded | Self::AuthoredReadyToMerge | Self::AuthoredWaiting => {
-                PrLane::Authored
-            }
-            Self::ReviewNeeded | Self::ReviewUpdate | Self::ReviewDone => PrLane::Review,
-            Self::Draft => PrLane::Draft,
-            Self::Other => PrLane::Other,
-        }
-    }
-}
-
-/// Top-level lane for organizing PRs in the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrLane {
-    Authored,
-    Review,
-    Draft,
-    Other,
-}
-
-impl PrLane {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Authored => "Authored",
-            Self::Review => "Review Requested",
-            Self::Draft => "Drafts",
-            Self::Other => "Other",
-        }
-    }
-
-    pub fn all_in_order() -> &'static [PrLane] {
-        &[Self::Authored, Self::Review, Self::Draft, Self::Other]
     }
 }
 
@@ -180,11 +115,12 @@ pub struct ReviewComment {
     pub body: String,
     pub path: String,
     pub line: Option<i64>,
-    /// ISO 8601 timestamp of the comment. Defaults to empty so store JSON
-    /// written before this field existed still deserializes.
+    /// ISO 8601 timestamp of the comment. Defaults to empty so payloads from
+    /// older daemon versions still deserialize (documented version-skew
+    /// tolerance).
     #[serde(default)]
     pub created_at: String,
-    /// Web URL of the comment. Defaults to empty for legacy store JSON.
+    /// Web URL of the comment. Defaults to empty for older daemon payloads.
     #[serde(default)]
     pub url: String,
 }
@@ -256,7 +192,7 @@ pub struct TimelineEvent {
     /// Human-readable detail: review state, commit message headline, comment excerpt, etc.
     pub detail: String,
     /// Web URL of the event (comments and reviews only; empty for other
-    /// event types and for legacy store JSON).
+    /// event types and for payloads from older daemon versions).
     #[serde(default)]
     pub url: String,
 }
@@ -271,8 +207,7 @@ pub struct PullRequest {
     pub url: String,
     pub author: String,
     /// Whether the author is a GitHub App/bot (GraphQL actor `__typename == "Bot"`,
-    /// e.g. dependabot). Defaults to false so store JSON written before this field
-    /// existed still deserializes.
+    /// e.g. dependabot).
     #[serde(default)]
     pub author_is_bot: bool,
     pub owner: String,
@@ -358,20 +293,6 @@ pub struct TeamMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn review_comment_defaults_for_legacy_json() {
-        // Persisted store JSON written before created_at/url existed must
-        // still deserialize, with the new fields defaulting to empty.
-        let json = r#"{"author":"bob","body":"fix","path":"src/main.rs","line":3}"#;
-        let comment: ReviewComment = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(comment.created_at, "");
-        assert_eq!(comment.url, "");
-
-        let json = r#"{"event_type":"comment","actor":"bob","created_at":"2024-01-01T00:00:00Z","detail":"hi"}"#;
-        let event: TimelineEvent = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(event.url, "");
-    }
 
     #[test]
     fn test_parse_slug_valid() {

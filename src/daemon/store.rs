@@ -260,15 +260,6 @@ impl PrStore {
             .find(|pr| pr.owner == owner && pr.repo == repo && pr.number == number)
     }
 
-    /// Get a mutable PR by its slug.
-    #[allow(dead_code)]
-    pub fn get_by_slug_mut(&mut self, slug: &str) -> Option<&mut PullRequest> {
-        let (owner, repo, number) = parse_slug(slug)?;
-        self.prs
-            .values_mut()
-            .find(|pr| pr.owner == owner && pr.repo == repo && pr.number == number)
-    }
-
     /// Get a cached diff.
     pub fn get_diff(&self, slug: &str) -> Option<&String> {
         self.cached_diffs.get(slug)

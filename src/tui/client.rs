@@ -32,11 +32,6 @@ impl DaemonClient {
         Ok(Self { base_url, client })
     }
 
-    #[allow(dead_code)]
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self.client.get(&url).send().await?;

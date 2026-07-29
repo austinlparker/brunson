@@ -220,10 +220,7 @@ fn write_pid_file() -> Result<()> {
     let pid_path = dir.join("daemon.pid");
     let pid = std::process::id();
 
-    // Write atomically: write to temp then rename
-    let tmp_path = dir.join("daemon.pid.tmp");
-    std::fs::write(&tmp_path, pid.to_string())?;
-    std::fs::rename(&tmp_path, &pid_path)?;
+    std::fs::write(&pid_path, pid.to_string())?;
 
     info!("PID {} written to {}", pid, pid_path.display());
     Ok(())

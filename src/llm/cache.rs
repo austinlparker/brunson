@@ -52,19 +52,6 @@ impl LlmClassificationCache {
         Ok(cache)
     }
 
-    /// Persist the cache to disk.
-    pub fn save(&self) -> Result<()> {
-        let path = cache_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create LLM cache dir {}", parent.display()))?;
-        }
-        let text = serde_json::to_string_pretty(self).context("Failed to serialize LLM cache")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("Failed to write LLM cache to {}", path.display()))?;
-        Ok(())
-    }
-
     /// Hydrate a PR from the cache if the cached data is still valid.
     pub fn apply_to_pr(&self, pr: &mut PullRequest) {
         let Some(entry) = self.entries.get(&pr.node_id) else {
