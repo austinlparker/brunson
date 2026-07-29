@@ -166,6 +166,28 @@ impl GitHubClient {
     }
 }
 
+/// Minimal GraphQL transport seam: PR-detail fetching and pagination are
+/// generic over this trait so tests can drive them with a recording mock
+/// instead of a live `GitHubClient`. Deliberately not a general HTTP
+/// abstraction — one method, GraphQL only.
+pub trait GraphqlTransport: Sync {
+    fn graphql_query(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value>> + Send;
+}
+
+impl GraphqlTransport for GitHubClient {
+    async fn graphql_query(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.graphql_with_variables(query, variables).await
+    }
+}
+
 /// Resolve REST and GraphQL base URLs from a host string.
 pub fn resolve_api_urls(host: &str) -> (String, String) {
     if host == "github.com" {
