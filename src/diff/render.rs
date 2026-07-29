@@ -232,7 +232,9 @@ fn find_first_hunk_for_file(lines: &[ParsedDiffLine], path: &str) -> Option<usiz
     })
 }
 
-fn outdated_comment(comment: &crate::github::types::ReviewComment) -> crate::github::types::ReviewComment {
+fn outdated_comment(
+    comment: &crate::github::types::ReviewComment,
+) -> crate::github::types::ReviewComment {
     let mut c = comment.clone();
     c.body = format!("[outdated] {}", c.body);
     c

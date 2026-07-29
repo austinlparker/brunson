@@ -154,7 +154,60 @@ const MAX_CONNECTION_PAGES: usize = 20;
 // with `first: 100` and never paginated (a PR with >100 requested reviewers
 // does not occur in practice; worst case the reviewer list is cosmetically
 // truncated).
-const PR_DETAIL_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!) {
+//
+// Keep each connection selection in one macro so initial and continuation
+// queries cannot silently drift when a node field or event fragment changes.
+macro_rules! review_threads_connection {
+    ($pagination:literal) => {
+        concat!(
+            "reviewThreads(first: 100",
+            $pagination,
+            ") {",
+            " pageInfo { hasNextPage endCursor }",
+            " nodes { id isResolved isOutdated",
+            " comments(first: 100) { pageInfo { hasNextPage endCursor }",
+            " nodes { author { login } body path line createdAt url } }",
+            " } }"
+        )
+    };
+}
+
+macro_rules! timeline_items_connection {
+    ($pagination:literal) => {
+        concat!(
+            "timelineItems(first: 100", $pagination, ") {",
+            " pageInfo { hasNextPage endCursor }",
+            " nodes { __typename",
+            " ... on IssueComment { author { login } body createdAt url }",
+            " ... on PullRequestReview { author { login } body state submittedAt url }",
+            " ... on PullRequestCommit { commit { author { user { login } } messageHeadline committedDate } }",
+            " ... on HeadRefForcePushedEvent { actor { login } createdAt }",
+            " ... on ReadyForReviewEvent { actor { login } createdAt }",
+            " ... on ReviewRequestedEvent { actor { login } createdAt requestedReviewer { ... on User { login } ... on Team { slug name organization { login } } } }",
+            " ... on ReviewDismissedEvent { actor { login } createdAt }",
+            " ... on MergedEvent { actor { login } createdAt }",
+            " ... on ClosedEvent { actor { login } createdAt }",
+            " ... on ReopenedEvent { actor { login } createdAt }",
+            " } }"
+        )
+    };
+}
+
+macro_rules! files_connection {
+    ($pagination:literal) => {
+        concat!(
+            "files(first: 100",
+            $pagination,
+            ") {",
+            " pageInfo { hasNextPage endCursor }",
+            " nodes { path additions deletions changeType }",
+            " }"
+        )
+    };
+}
+
+const PR_DETAIL_QUERY: &str = concat!(
+    r#"query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       id
@@ -208,107 +261,15 @@ const PR_DETAIL_QUERY: &str = r#"query($owner: String!, $repo: String!, $number:
         }
       }
     }
-    reviewThreads(first: 100) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        id
-        isResolved
-        isOutdated
-        comments(first: 100) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          nodes {
-            author { login }
-            body
-            path
-            line
-            createdAt
-            url
-          }
-        }
-      }
-    }
-    timelineItems(first: 100) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        __typename
-        ... on IssueComment {
-          author { login }
-          body
-          createdAt
-          url
-        }
-        ... on PullRequestReview {
-          author { login }
-          body
-          state
-          submittedAt
-          url
-        }
-        ... on PullRequestCommit {
-          commit {
-            author { user { login } }
-            messageHeadline
-            committedDate
-          }
-        }
-        ... on HeadRefForcePushedEvent {
-          actor { login }
-          createdAt
-        }
-        ... on ReadyForReviewEvent {
-          actor { login }
-          createdAt
-        }
-        ... on ReviewRequestedEvent {
-          actor { login }
-          createdAt
-          requestedReviewer {
-            ... on User { login }
-            ... on Team { slug name organization { login } }
-          }
-        }
-        ... on ReviewDismissedEvent {
-          actor { login }
-          createdAt
-        }
-        ... on MergedEvent {
-          actor { login }
-          createdAt
-        }
-        ... on ClosedEvent {
-          actor { login }
-          createdAt
-        }
-        ... on ReopenedEvent {
-          actor { login }
-          createdAt
-        }
-      }
-    }
-    files(first: 100) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        path
-        additions
-        deletions
-        changeType
-      }
-    }
+    "#,
+    review_threads_connection!(""),
+    timeline_items_connection!(""),
+    files_connection!(""),
+    r#"
     }
   }
-}"#;
+}"#
+);
 
 const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($threadId: ID!, $after: String) {
   node(id: $threadId) {
@@ -331,133 +292,35 @@ const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($threadId: ID!, $after: Stri
   }
 }"#;
 
-// Narrow continuation query for the `timelineItems` connection only. Node
-// selection must stay in sync with `PR_DETAIL_QUERY` so `parse_timeline`
-// parses both identically.
-const PR_TIMELINE_ITEMS_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+const PR_TIMELINE_ITEMS_QUERY: &str = concat!(
+    r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      timelineItems(first: 100, after: $after) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          __typename
-          ... on IssueComment {
-            author { login }
-            body
-            createdAt
-            url
-          }
-          ... on PullRequestReview {
-            author { login }
-            body
-            state
-            submittedAt
-            url
-          }
-          ... on PullRequestCommit {
-            commit {
-              author { user { login } }
-              messageHeadline
-              committedDate
-            }
-          }
-          ... on HeadRefForcePushedEvent {
-            actor { login }
-            createdAt
-          }
-          ... on ReadyForReviewEvent {
-            actor { login }
-            createdAt
-          }
-          ... on ReviewRequestedEvent {
-            actor { login }
-            createdAt
-            requestedReviewer {
-              ... on User { login }
-              ... on Team { slug name organization { login } }
-            }
-          }
-          ... on ReviewDismissedEvent {
-            actor { login }
-            createdAt
-          }
-          ... on MergedEvent {
-            actor { login }
-            createdAt
-          }
-          ... on ClosedEvent {
-            actor { login }
-            createdAt
-          }
-          ... on ReopenedEvent {
-            actor { login }
-            createdAt
-          }
-        }
-      }
-    }
+    pullRequest(number: $number) { "#,
+    timeline_items_connection!(", after: $after"),
+    r#" }
   }
-}"#;
+}"#
+);
 
-// Narrow continuation query for the `reviewThreads` connection only. Node
-// selection must stay in sync with `PR_DETAIL_QUERY` so thread records
-// (including the `id` used for nested comment pagination) parse identically.
-const PR_REVIEW_THREADS_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+const PR_REVIEW_THREADS_QUERY: &str = concat!(
+    r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100, after: $after) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          id
-          isResolved
-          isOutdated
-          comments(first: 100) {
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-            nodes {
-              author { login }
-              body
-              path
-              line
-              createdAt
-              url
-            }
-          }
-        }
-      }
-    }
+    pullRequest(number: $number) { "#,
+    review_threads_connection!(", after: $after"),
+    r#" }
   }
-}"#;
+}"#
+);
 
-// Narrow continuation query for the `files` connection only. Node selection
-// must stay in sync with `PR_DETAIL_QUERY` so `parse_files` parses both
-// identically.
-const PR_FILES_QUERY: &str = r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+const PR_FILES_QUERY: &str = concat!(
+    r#"query($owner: String!, $repo: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      files(first: 100, after: $after) {
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-        nodes {
-          path
-          additions
-          deletions
-          changeType
-        }
-      }
-    }
+    pullRequest(number: $number) { "#,
+    files_connection!(", after: $after"),
+    r#" }
   }
-}"#;
+}"#
+);
 
 fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullRequest {
     let node_id = pr["id"].as_str().unwrap_or("").to_string();
@@ -508,8 +371,6 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
 
     let (check_status, checks) = parse_checks(&pr["commits"]["nodes"]);
 
-    let review_threads = parse_review_threads(&pr["reviewThreads"]["nodes"]);
-
     let timeline = parse_timeline(&pr["timelineItems"]["nodes"]);
 
     let files = parse_files(&pr["files"]["nodes"]);
@@ -536,7 +397,9 @@ fn parse_single_pr(pr: &serde_json::Value, owner: &str, repo: &str) -> PullReque
         latest_reviews,
         check_status,
         checks,
-        review_threads,
+        // Review threads are parsed as ThreadRecords in fetch_pr_detail so
+        // their GraphQL ids survive nested comment pagination.
+        review_threads: Vec::new(),
         timeline,
         files,
         comments: 0,
@@ -631,13 +494,6 @@ fn parse_checks(commits: &serde_json::Value) -> (CheckStatus, Vec<CheckEntry>) {
         .unwrap_or_default();
 
     (status, checks)
-}
-
-fn parse_review_threads(nodes: &serde_json::Value) -> Vec<ReviewThread> {
-    parse_thread_records(nodes)
-        .into_iter()
-        .map(|record| record.thread)
-        .collect()
 }
 
 /// Cursor state of one GraphQL connection, parsed from its `pageInfo`.
@@ -939,15 +795,16 @@ pub async fn fetch_pr_details<C: GraphqlTransport>(
         .enumerate()
         .map(|(index, r)| (index, r.repo_owner.clone(), r.repo_name.clone(), r.number))
         .collect();
-    let fetches = keys.into_iter().map(|(index, owner, repo, number)| async move {
-        let outcome = fetch_pr_detail(client, &owner, &repo, number).await;
-        (index, owner, repo, number, outcome)
-    });
+    let fetches = keys
+        .into_iter()
+        .map(|(index, owner, repo, number)| async move {
+            let outcome = fetch_pr_detail(client, &owner, &repo, number).await;
+            (index, owner, repo, number, outcome)
+        });
 
     let mut indexed: Vec<(usize, PullRequest)> = Vec::new();
     let mut failed: Vec<(String, String, u64)> = Vec::new();
-    let mut stream =
-        futures::stream::iter(fetches).buffer_unordered(PR_DETAIL_FETCH_CONCURRENCY);
+    let mut stream = futures::stream::iter(fetches).buffer_unordered(PR_DETAIL_FETCH_CONCURRENCY);
     while let Some((index, owner, repo, number, outcome)) = stream.next().await {
         match outcome {
             Ok(Some(pr)) => indexed.push((index, pr)),
@@ -1121,7 +978,10 @@ async fn paginate_thread_comments<C: GraphqlTransport>(
         if conn.is_null() {
             return Err(anyhow!("GraphQL page missing review thread comments"));
         }
-        record.thread.comments.extend(parse_review_comments(&conn["nodes"]));
+        record
+            .thread
+            .comments
+            .extend(parse_review_comments(&conn["nodes"]));
         record.comments_page = PageInfo::parse(conn);
         pages += 1;
     }
@@ -1337,13 +1197,13 @@ mod tests {
             }
         }]);
 
-        let threads = parse_review_threads(&nodes);
+        let threads = parse_thread_records(&nodes);
         assert_eq!(threads.len(), 1);
-        assert!(!threads[0].is_resolved);
-        assert!(threads[0].is_outdated);
-        assert_eq!(threads[0].comments.len(), 1);
-        assert_eq!(threads[0].comments[0].author, "bob");
-        assert_eq!(threads[0].comments[0].line, Some(42));
+        assert!(!threads[0].thread.is_resolved);
+        assert!(threads[0].thread.is_outdated);
+        assert_eq!(threads[0].thread.comments.len(), 1);
+        assert_eq!(threads[0].thread.comments[0].author, "bob");
+        assert_eq!(threads[0].thread.comments[0].line, Some(42));
     }
 
     #[test]
@@ -1363,10 +1223,13 @@ mod tests {
             }
         }]);
 
-        let threads = parse_review_threads(&nodes);
-        assert_eq!(threads[0].comments[0].created_at, "2024-01-15T10:00:00Z");
+        let threads = parse_thread_records(&nodes);
         assert_eq!(
-            threads[0].comments[0].url,
+            threads[0].thread.comments[0].created_at,
+            "2024-01-15T10:00:00Z"
+        );
+        assert_eq!(
+            threads[0].thread.comments[0].url,
             "https://github.com/org/repo/pull/1#discussion_r7"
         );
 
@@ -1376,9 +1239,9 @@ mod tests {
             "isOutdated": false,
             "comments": { "nodes": [{ "author": { "login": "bob" }, "body": "b", "path": "p", "line": 1 }] }
         }]);
-        let threads = parse_review_threads(&legacy);
-        assert_eq!(threads[0].comments[0].created_at, "");
-        assert_eq!(threads[0].comments[0].url, "");
+        let threads = parse_thread_records(&legacy);
+        assert_eq!(threads[0].thread.comments[0].created_at, "");
+        assert_eq!(threads[0].thread.comments[0].url, "");
     }
 
     #[test]
@@ -1661,7 +1524,11 @@ mod tests {
         })
     }
 
-    fn thread_node(id: &str, comment_bodies: &[&str], page: serde_json::Value) -> serde_json::Value {
+    fn thread_node(
+        id: &str,
+        comment_bodies: &[&str],
+        page: serde_json::Value,
+    ) -> serde_json::Value {
         let comments: Vec<_> = comment_bodies
             .iter()
             .map(|b| {
@@ -1759,7 +1626,12 @@ mod tests {
         // The continuation request fetches only its own connection: none of
         // the other four connections' field names appear in the query body.
         assert!(continuation_query.contains("timelineItems"));
-        for other in ["reviewThreads", "files(", "reviewRequests", "statusCheckRollup"] {
+        for other in [
+            "reviewThreads",
+            "files(",
+            "reviewRequests",
+            "statusCheckRollup",
+        ] {
             assert!(
                 !continuation_query.contains(other),
                 "continuation query for timelineItems must not fetch {}",
@@ -1913,7 +1785,10 @@ mod tests {
         assert_eq!(numbers, vec![1, 2, 4, 6, 7, 8, 9, 10]);
         // Only the transient failure is reported as failed — vanished PRs
         // are genuinely gone and must not be preserved by callers.
-        assert_eq!(fetch.failed, vec![("org".to_string(), "repo".to_string(), 5)]);
+        assert_eq!(
+            fetch.failed,
+            vec![("org".to_string(), "repo".to_string(), 5)]
+        );
 
         assert!(
             transport.max_in_flight() <= PR_DETAIL_FETCH_CONCURRENCY,

@@ -138,7 +138,10 @@ mod tests {
         assert_eq!(value["ready"], false);
         assert_eq!(value["status"], "missing_auth");
         // Advice is the first issue's advice.
-        assert_eq!(value["advice"], "GitHub auth is missing. Run `gh auth login`.");
+        assert_eq!(
+            value["advice"],
+            "GitHub auth is missing. Run `gh auth login`."
+        );
 
         // Prompts correspond 1:1 to issues, with the four prompt keys.
         let prompts = value["prompts"].as_array().unwrap();

@@ -181,10 +181,7 @@ async fn run_poll_cycle(
         // De-duplicate while preserving query provenance. Scope is enforced
         // once, after hydration, by filter_prs_by_provenance below.
         let provenance = dedup_provenanced_results(all_results);
-        let results: Vec<_> = provenance
-            .iter()
-            .map(|item| item.result.clone())
-            .collect();
+        let results: Vec<_> = provenance.iter().map(|item| item.result.clone()).collect();
 
         info!(
             "Found {} unique PRs from {} queries",

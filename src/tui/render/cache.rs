@@ -2,8 +2,8 @@ use ratatui::text::Line;
 use std::collections::HashMap;
 
 use crate::api::PrDetailResponse;
-use crate::github::types::ReviewComment;
 use crate::diff::render::{parse_diff, ParsedDiffLine};
+use crate::github::types::ReviewComment;
 use crate::tui::views::markdown::markdown_lines;
 
 /// Identity for a PR detail: enough to tell whether the *content* a section
@@ -711,7 +711,11 @@ mod tests {
         );
     }
 
-    fn timeline_event(actor: &str, created_at: &str, detail: &str) -> crate::github::types::TimelineEvent {
+    fn timeline_event(
+        actor: &str,
+        created_at: &str,
+        detail: &str,
+    ) -> crate::github::types::TimelineEvent {
         crate::github::types::TimelineEvent {
             event_type: crate::github::types::TimelineEventType::Comment,
             actor: actor.to_string(),
@@ -721,7 +725,11 @@ mod tests {
         }
     }
 
-    fn thread_comment(author: &str, body: &str, created_at: &str) -> crate::github::types::ReviewComment {
+    fn thread_comment(
+        author: &str,
+        body: &str,
+        created_at: &str,
+    ) -> crate::github::types::ReviewComment {
         crate::github::types::ReviewComment {
             author: author.to_string(),
             body: body.to_string(),

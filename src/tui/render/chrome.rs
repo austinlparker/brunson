@@ -96,4 +96,3 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         h,
     )
 }
-

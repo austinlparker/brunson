@@ -4,8 +4,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::github::types::ReviewComment;
 use crate::diff::render::{DiffLineType, ParsedDiffLine};
+use crate::github::types::ReviewComment;
 use crate::tui::render::component::RenderContext;
 use crate::tui::render::layout::fill;
 use crate::tui::render::primitives::ScrollViewport;

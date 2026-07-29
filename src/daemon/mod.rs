@@ -175,7 +175,8 @@ pub async fn run_daemon(config: Config, config_path: Option<PathBuf>) -> Result<
 
     // Run an eager setup diagnostic so the first /health and /setup/status
     // requests return real data instead of placeholder defaults.
-    let initial_setup = evaluate_setup(app_state.config_path.as_deref(), app_state.auth.as_ref()).await;
+    let initial_setup =
+        evaluate_setup(app_state.config_path.as_deref(), app_state.auth.as_ref()).await;
     {
         let mut cache = setup_cache.write().await;
         cache.cached_at = Some(std::time::Instant::now());
