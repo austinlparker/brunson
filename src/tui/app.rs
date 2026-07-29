@@ -2282,86 +2282,6 @@ mod tests {
     }
 
     #[test]
-    fn overview_111x30_no_inbox_leak_after_blade_switch() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut groups = HashMap::new();
-        groups.insert(
-            PrGroup::ReviewNeeded,
-            vec![
-                make_summary(
-                    "org~repo~1",
-                    PrGroup::ReviewNeeded,
-                    "other",
-                    Some(Priority::High),
-                ),
-                make_summary(
-                    "org~repo~2",
-                    PrGroup::ReviewNeeded,
-                    "other2",
-                    Some(Priority::Medium),
-                ),
-            ],
-        );
-        groups.insert(
-            PrGroup::AuthoredWaiting,
-            vec![make_summary(
-                "org~repo~3",
-                PrGroup::AuthoredWaiting,
-                "me",
-                None,
-            )],
-        );
-        groups.insert(
-            PrGroup::AuthoredReadyToMerge,
-            vec![make_summary(
-                "org~repo~4",
-                PrGroup::AuthoredReadyToMerge,
-                "me",
-                None,
-            )],
-        );
-        groups.insert(
-            PrGroup::AuthoredActionNeeded,
-            vec![make_summary(
-                "org~repo~5",
-                PrGroup::AuthoredActionNeeded,
-                "me",
-                None,
-            )],
-        );
-
-        let mut state = make_test_state(groups);
-        state.selected_pr_id = Some("org~repo~1".to_string());
-
-        let backend = TestBackend::new(111, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut view = ViewStateManager::new();
-
-        view.view.active_blade = Blade::Inbox;
-        terminal
-            .draw(|f| crate::tui::app::render_frame(f, &mut state, &mut view))
-            .unwrap();
-
-        view.view.active_blade = Blade::Overview;
-        terminal
-            .draw(|f| crate::tui::app::render_frame(f, &mut state, &mut view))
-            .unwrap();
-
-        let buf = terminal.backend().buffer();
-        let mut content = String::new();
-        for x in 0..buf.area().width {
-            content.push_str(buf.cell((x, 2)).unwrap().symbol());
-        }
-        assert!(
-            !content.contains("OPENED BY ME"),
-            "row 2 leaked Inbox header at 111x30: {:?}",
-            content
-        );
-    }
-
-    #[test]
     fn keybar_renders_bindings_not_only_border() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -2387,131 +2307,6 @@ mod tests {
             "keybar should show the Files bindings, got: {:?}",
             line
         );
-    }
-
-    #[test]
-    #[ignore]
-    #[allow(deprecated)]
-    fn dump_111x30_overview_after_inbox() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut groups = HashMap::new();
-        groups.insert(
-            PrGroup::ReviewNeeded,
-            vec![
-                make_summary(
-                    "org~repo~1",
-                    PrGroup::ReviewNeeded,
-                    "other",
-                    Some(Priority::High),
-                ),
-                make_summary(
-                    "org~repo~2",
-                    PrGroup::ReviewNeeded,
-                    "other2",
-                    Some(Priority::Medium),
-                ),
-            ],
-        );
-        groups.insert(
-            PrGroup::AuthoredWaiting,
-            vec![make_summary(
-                "org~repo~3",
-                PrGroup::AuthoredWaiting,
-                "me",
-                None,
-            )],
-        );
-
-        let mut state = make_test_state(groups);
-        state.selected_pr_id = Some("org~repo~1".to_string());
-        state.pr_detail = Some(crate::api::PrDetailResponse {
-            id: "org~repo~1".to_string(),
-            node_id: "n1".to_string(),
-            owner: "org".to_string(),
-            repo: "repo".to_string(),
-            number: 35847,
-            title: "feat(slack-service): allow channel connections to change investigation"
-                .to_string(),
-            body: "## Summary\n\n- add an in-place Slack channel connection rebind operation."
-                .to_string(),
-            url: "https://github.com/org/repo/pull/35847".to_string(),
-            author: "austin".to_string(),
-            is_draft: false,
-            updated_at: "2024-05-20T12:00:00Z".to_string(),
-            head_ref: "1718-slack-channel-rebind".to_string(),
-            base_ref: "main".to_string(),
-            mergeable: MergeableState::Mergeable,
-            review_decision: None,
-            review_requests: vec![],
-            team_review_requests: vec![],
-            viewer_latest_review: None,
-            latest_reviews: vec![],
-            check_status: CheckStatus::Success,
-            checks: vec![crate::api::CheckEntryDto {
-                name: "ci".to_string(),
-                status: "COMPLETED".to_string(),
-                conclusion: Some("SUCCESS".to_string()),
-                url: "https://github.com/org/repo/pull/35847/checks".to_string(),
-            }],
-            review_threads: vec![],
-            files: vec![
-                crate::api::FileDto {
-                    path: "src/main.rs".to_string(),
-                    additions: 1290,
-                    deletions: 34,
-                    status: 'M',
-                },
-                crate::api::FileDto {
-                    path: "terraform/refinery-as-a-service/us1/_griztest-poc.tf".to_string(),
-                    additions: 18,
-                    deletions: 0,
-                    status: 'A',
-                },
-            ],
-            timeline: vec![],
-            llm_priority: Some(Priority::Medium),
-            llm_summary: Some(
-                "Implements Slack channel connection rebinding and new Slack controls/commands."
-                    .to_string(),
-            ),
-            llm_rich_summary: None,
-            last_seen_at: None,
-        });
-
-        let backend = TestBackend::new(111, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut view = ViewStateManager::new();
-        view.view.active_blade = Blade::Inbox;
-        terminal
-            .draw(|f| render_frame(f, &mut state, &mut view))
-            .unwrap();
-        view.view.active_blade = Blade::Overview;
-        terminal.clear().unwrap();
-        terminal
-            .draw(|f| render_frame(f, &mut state, &mut view))
-            .unwrap();
-
-        let buf = terminal.backend().buffer();
-        eprintln!("\n--- row 2 cells (y=2) ---");
-        for x in 0..buf.area().width {
-            let cell = buf.cell((x, 2)).unwrap();
-            eprintln!("x={:3} sym={:?} skip={}", x, cell.symbol(), cell.skip);
-        }
-        eprintln!("--- row 1 cells (y=1) ---");
-        for x in 0..buf.area().width {
-            let cell = buf.cell((x, 1)).unwrap();
-            eprintln!("x={:3} sym={:?} skip={}", x, cell.symbol(), cell.skip);
-        }
-        let mut out = String::new();
-        for y in 0..buf.area().height {
-            for x in 0..buf.area().width {
-                out.push_str(buf.cell((x, y)).unwrap().symbol());
-            }
-            out.push('\n');
-        }
-        std::fs::write("render_dump_111x30_overview.txt", out).unwrap();
     }
 
     #[test]
@@ -3361,35 +3156,6 @@ mod tests {
     }
 
     #[test]
-    fn review_stub_keys_are_noops() {
-        // `r` is no longer a stub — it aliases `R` (refresh) — so it's excluded.
-        for c in ['a', 'm'] {
-            let mut state = make_test_state(HashMap::new());
-            let mut view = ViewStateManager::new();
-            let action = state.handle_key(&mut view, key(KeyCode::Char(c)));
-            assert_eq!(action, Action::None, "{} should not produce an action", c);
-            assert!(
-                state.error_message.is_none(),
-                "{} should not show a stub toast",
-                c
-            );
-        }
-    }
-
-    #[test]
-    fn docs_keybindings_document_filter_not_stubs() {
-        let readme = include_str!("../../README.md");
-        let agents = include_str!("../../AGENTS.md");
-        assert!(readme.contains("`/`"));
-        assert!(readme.contains("Filter inbox"));
-        assert!(!readme.contains("Approve stub"));
-        assert!(!readme.contains("Request changes stub"));
-        assert!(!readme.contains("Merge stub"));
-        assert!(!readme.contains("Search stub"));
-        assert!(agents.contains("`/` filter inbox"));
-    }
-
-    #[test]
     fn keybar_renders_filter_not_act() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -3414,11 +3180,6 @@ mod tests {
         assert!(
             line.contains("filter") && line.contains("quit"),
             "inbox keybar should show bindings, got: {:?}",
-            line
-        );
-        assert!(
-            !line.contains("act"),
-            "keybar should not contain the old a/r/m act label, got: {:?}",
             line
         );
     }

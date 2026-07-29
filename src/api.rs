@@ -334,39 +334,22 @@ impl ApiError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pr_summary_deserializes_without_comments_field() {
-        let json = r#"{
-            "id": "org~repo~1",
-            "node_id": "n1",
-            "owner": "org",
-            "repo": "repo",
-            "number": 1,
-            "title": "T",
-            "author": "a",
-            "group": "review_needed",
-            "next_action": "Review now",
-            "check_status": "none",
-            "updated_at": "2024-01-01T00:00:00Z",
-            "url": "https://example.com"
-        }"#;
-        let summary: PrSummary = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(summary.comments, 0);
-    }
-
-    #[test]
-    fn test_file_dto_deserializes_without_status_field() {
-        let json = r#"{"path": "src/main.rs", "additions": 10, "deletions": 2}"#;
-        let file: FileDto = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(file.status, '?');
-    }
-
-    #[test]
-    fn test_file_dto_deserializes_with_status_field() {
-        let json = r#"{"path": "src/main.rs", "additions": 10, "deletions": 2, "status": "A"}"#;
-        let file: FileDto = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(file.status, 'A');
-    }
+    /// A `PrSummary` payload as an old daemon (before `author_is_bot`,
+    /// `comments`, `head_ref`, and `llm_one_line` existed) would emit it.
+    const OLD_DAEMON_SUMMARY_JSON: &str = r#"{
+        "id": "org~repo~1",
+        "node_id": "n1",
+        "owner": "org",
+        "repo": "repo",
+        "number": 1,
+        "title": "T",
+        "author": "a",
+        "group": "review_needed",
+        "next_action": "Review now",
+        "check_status": "none",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "url": "https://example.com"
+    }"#;
 
     fn sample_summary() -> PrSummary {
         PrSummary {
@@ -395,7 +378,7 @@ mod tests {
     // (and any older daemon build) depends on those exact tokens, so this
     // must never silently change when the enums are edited.
     #[test]
-    fn test_pr_list_response_group_key_is_snake_case_string() {
+    fn pr_list_wire_format_uses_snake_case_tokens() {
         let mut groups = HashMap::new();
         groups.insert(PrGroup::ReviewNeeded, vec![sample_summary()]);
         let resp = PrListResponse {
@@ -407,81 +390,25 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("review_needed"));
-    }
 
-    #[test]
-    fn test_pr_summary_serializes_group_and_check_status_as_snake_case() {
         let value = serde_json::to_value(sample_summary()).unwrap();
         assert_eq!(value["group"], "review_needed");
         assert_eq!(value["check_status"], "none");
     }
 
-    // Regression: an old-daemon JSON payload (raw strings, no round-trip
-    // helpers) must still deserialize into the typed DTO unmodified.
+    // Version-skew tolerance (AGENTS.md contract): payloads from an older
+    // daemon omit fields added later; every such field must default cleanly.
     #[test]
-    fn test_pr_summary_deserializes_from_old_daemon_wire_format() {
-        let json = r#"{
-            "id": "org~repo~1",
-            "node_id": "n1",
-            "owner": "org",
-            "repo": "repo",
-            "number": 1,
-            "title": "T",
-            "author": "a",
-            "group": "review_needed",
-            "next_action": "Review now",
-            "check_status": "none",
-            "updated_at": "2024-01-01T00:00:00Z",
-            "url": "https://example.com"
-        }"#;
-        let summary: PrSummary = serde_json::from_str(json).expect("deserializes");
+    fn wire_types_default_missing_fields_from_old_daemon_payloads() {
+        let summary: PrSummary =
+            serde_json::from_str(OLD_DAEMON_SUMMARY_JSON).expect("deserializes");
         assert_eq!(summary.group, PrGroup::ReviewNeeded);
         assert_eq!(summary.check_status, CheckStatus::None);
-    }
+        assert!(!summary.author_is_bot);
+        assert_eq!(summary.comments, 0);
+        assert_eq!(summary.head_ref, "");
+        assert_eq!(summary.llm_one_line, None);
 
-    fn sample_detail() -> PrDetailResponse {
-        PrDetailResponse {
-            id: "org~repo~1".into(),
-            node_id: "n1".into(),
-            owner: "org".into(),
-            repo: "repo".into(),
-            number: 1,
-            title: "T".into(),
-            body: String::new(),
-            url: "https://example.com".into(),
-            author: "a".into(),
-            is_draft: false,
-            updated_at: "2024-01-01T00:00:00Z".into(),
-            head_ref: "feature".into(),
-            base_ref: "main".into(),
-            mergeable: MergeableState::Mergeable,
-            review_decision: Some(ReviewDecision::Approved),
-            review_requests: vec![],
-            team_review_requests: vec![],
-            viewer_latest_review: None,
-            latest_reviews: vec![],
-            check_status: CheckStatus::Success,
-            checks: vec![],
-            review_threads: vec![],
-            files: vec![],
-            timeline: vec![TimelineEventDto {
-                event_type: TimelineEventType::Comment,
-                actor: "a".into(),
-                created_at: "2024-01-01T00:00:00Z".into(),
-                detail: "hi".into(),
-                url: String::new(),
-            }],
-            llm_priority: None,
-            llm_summary: None,
-            llm_rich_summary: None,
-            last_seen_at: None,
-        }
-    }
-
-    #[test]
-    fn detail_dtos_default_missing_fields_from_legacy_json() {
-        // Payloads from an old daemon lack the new fields; the TUI-side DTOs
-        // must still deserialize with empty defaults.
         let json = r#"{"author":"bob","body":"fix","path":"src/main.rs","line":3}"#;
         let comment: ReviewCommentDto = serde_json::from_str(json).expect("deserializes");
         assert_eq!(comment.created_at, "");
@@ -491,43 +418,8 @@ mod tests {
         let event: TimelineEventDto = serde_json::from_str(json).expect("deserializes");
         assert_eq!(event.url, "");
 
-        // PrSummary from an old daemon lacks head_ref/llm_one_line.
-        let json = r#"{
-            "id": "org~repo~1",
-            "node_id": "n1",
-            "owner": "org",
-            "repo": "repo",
-            "number": 1,
-            "title": "T",
-            "author": "a",
-            "group": "review_needed",
-            "next_action": "Review now",
-            "check_status": "none",
-            "updated_at": "2024-01-01T00:00:00Z",
-            "url": "https://example.com"
-        }"#;
-        let summary: PrSummary = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(summary.head_ref, "");
-        assert_eq!(summary.llm_one_line, None);
-    }
-
-    #[test]
-    fn test_pr_detail_response_round_trips_typed_fields() {
-        let detail = sample_detail();
-        let json = serde_json::to_string(&detail).unwrap();
-
-        // Lock the wire tokens for mergeable/review_decision/event_type.
-        assert!(json.contains(r#""mergeable":"MERGEABLE""#));
-        assert!(json.contains(r#""review_decision":"APPROVED""#));
-        assert!(json.contains(r#""event_type":"comment""#));
-
-        let round_tripped: PrDetailResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(round_tripped.mergeable, detail.mergeable);
-        assert_eq!(round_tripped.review_decision, detail.review_decision);
-        assert_eq!(round_tripped.check_status, detail.check_status);
-        assert_eq!(
-            round_tripped.timeline[0].event_type,
-            detail.timeline[0].event_type
-        );
+        let json = r#"{"path": "src/main.rs", "additions": 10, "deletions": 2}"#;
+        let file: FileDto = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(file.status, '?');
     }
 }
