@@ -47,6 +47,23 @@ fn json_summary(config_path: &Path, diagnostics: &SetupDiagnostics) -> String {
     .to_string()
 }
 
+/// The full non-interactive setup path for a given config location: ensure a
+/// default config file exists, evaluate diagnostics unconditionally (a
+/// malformed config must still produce a JSON summary with a `config_file`
+/// prompt carrying the parse error, instead of aborting before any output),
+/// and render the summary. `run_setup` prints exactly this string.
+async fn noninteractive_setup_summary(
+    config_path: &Path,
+    auth: &dyn crate::daemon::setup_status::SetupAuth,
+) -> Result<String> {
+    if !config_path.exists() {
+        let mut file = std::fs::File::create(config_path)?;
+        file.write_all(crate::config::example_config().as_bytes())?;
+    }
+    let diagnostics = evaluate_setup(Some(config_path), auth).await;
+    Ok(json_summary(config_path, &diagnostics))
+}
+
 pub async fn run_setup(args: &SetupArgs) -> Result<()> {
     let default_path =
         config_file_path().unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
@@ -54,15 +71,10 @@ pub async fn run_setup(args: &SetupArgs) -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
 
     if args.yes || args.json {
-        if !default_path.exists() {
-            let mut file = std::fs::File::create(&default_path)?;
-            file.write_all(crate::config::example_config().as_bytes())?;
-        }
-        // Evaluate unconditionally: a malformed config must still produce a
-        // JSON summary (with a config_file prompt carrying the parse error)
-        // instead of aborting before any output.
-        let diagnostics = evaluate_setup(Some(&default_path), &SetupAuthImpl).await;
-        println!("{}", json_summary(&default_path, &diagnostics));
+        println!(
+            "{}",
+            noninteractive_setup_summary(&default_path, &SetupAuthImpl).await?
+        );
         return Ok(());
     }
 
@@ -174,8 +186,12 @@ mod tests {
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, "this is [not valid toml").unwrap();
 
-        let diagnostics = evaluate_setup(Some(&config_path), &NoAuth).await;
-        let summary = json_summary(&config_path, &diagnostics);
+        // Exercise the same production path run_setup prints: this must
+        // succeed (not abort on the Config::load failure) and emit the full
+        // six-key summary.
+        let summary = noninteractive_setup_summary(&config_path, &NoAuth)
+            .await
+            .expect("malformed config still yields a JSON summary");
         let value: serde_json::Value = serde_json::from_str(&summary).unwrap();
 
         for key in JSON_KEYS {

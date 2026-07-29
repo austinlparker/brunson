@@ -442,8 +442,10 @@ mod tests {
 
     // Wire-format guard for the DTO→domain-type consolidation: the golden
     // fixture was captured from the pre-consolidation `*Dto` serialization,
-    // so this proves `PrDetailResponse` still serializes byte-identically
-    // (field names, enum tokens, defaults) after embedding the domain types.
+    // so this proves `PrDetailResponse` still serializes to a semantically
+    // identical JSON document (same field set, names, enum tokens, and
+    // defaults) after embedding the domain types. Key order/whitespace are
+    // not locked — JSON consumers must not depend on them.
     #[test]
     fn pr_detail_response_wire_format_is_unchanged() {
         let golden: serde_json::Value =

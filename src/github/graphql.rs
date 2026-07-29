@@ -910,16 +910,28 @@ fn parse_files(nodes: &serde_json::Value) -> Vec<PrFile> {
 /// Maximum PR detail fetches in flight at once.
 const PR_DETAIL_FETCH_CONCURRENCY: usize = 4;
 
+/// Outcome of hydrating a batch of search results.
+pub struct PrDetailFetch {
+    /// Hydrated PRs, in original input order.
+    pub prs: Vec<PullRequest>,
+    /// `(owner, repo, number)` keys whose detail fetch failed transiently
+    /// (network error, rate limit, ...). Callers should treat these as
+    /// still-live PRs of unknown state — not as gone. Vanished PRs (GitHub
+    /// returned `null`) are intentionally NOT listed here.
+    pub failed: Vec<(String, String, u64)>,
+}
+
 /// Fetch detail for search results with bounded concurrency.
 ///
 /// Ordering contract: survivors are emitted in original input order
 /// (inputs are already deduplicated upstream); vanished PRs (deleted or
-/// permission-lost between search and hydration) and failed fetches are
-/// discarded.
+/// permission-lost between search and hydration) are discarded; failed
+/// fetches are discarded from `prs` but reported via `failed` so callers
+/// can avoid dropping previously known-good state.
 pub async fn fetch_pr_details<C: GraphqlTransport>(
     client: &C,
     results: &[SearchResult],
-) -> Result<Vec<PullRequest>> {
+) -> Result<PrDetailFetch> {
     use futures::stream::StreamExt;
 
     let keys: Vec<(usize, String, String, u64)> = results
@@ -933,6 +945,7 @@ pub async fn fetch_pr_details<C: GraphqlTransport>(
     });
 
     let mut indexed: Vec<(usize, PullRequest)> = Vec::new();
+    let mut failed: Vec<(String, String, u64)> = Vec::new();
     let mut stream =
         futures::stream::iter(fetches).buffer_unordered(PR_DETAIL_FETCH_CONCURRENCY);
     while let Some((index, owner, repo, number, outcome)) = stream.next().await {
@@ -941,14 +954,18 @@ pub async fn fetch_pr_details<C: GraphqlTransport>(
             Ok(None) => {} // PR vanished between search and hydration.
             Err(e) => {
                 warn!(
-                    "Failed to fetch PR detail for {}/{}/{}: {}; dropping from this poll",
+                    "Failed to fetch PR detail for {}/{}/{}: {}; keeping previously stored data",
                     owner, repo, number, e
                 );
+                failed.push((owner, repo, number));
             }
         }
     }
     indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed.into_iter().map(|(_, pr)| pr).collect())
+    Ok(PrDetailFetch {
+        prs: indexed.into_iter().map(|(_, pr)| pr).collect(),
+        failed,
+    })
 }
 
 async fn fetch_pr_detail<C: GraphqlTransport>(
@@ -1888,12 +1905,15 @@ mod tests {
         .with_delay(std::time::Duration::from_millis(10));
 
         let results: Vec<SearchResult> = (1..=10).map(search_result).collect();
-        let prs = fetch_pr_details(&transport, &results).await.unwrap();
+        let fetch = fetch_pr_details(&transport, &results).await.unwrap();
 
-        // Failed (5) and vanished (3) PRs are discarded; survivors keep the
-        // original input order.
-        let numbers: Vec<u64> = prs.iter().map(|pr| pr.number).collect();
+        // Failed (5) and vanished (3) PRs are discarded from the hydrated
+        // list; survivors keep the original input order.
+        let numbers: Vec<u64> = fetch.prs.iter().map(|pr| pr.number).collect();
         assert_eq!(numbers, vec![1, 2, 4, 6, 7, 8, 9, 10]);
+        // Only the transient failure is reported as failed — vanished PRs
+        // are genuinely gone and must not be preserved by callers.
+        assert_eq!(fetch.failed, vec![("org".to_string(), "repo".to_string(), 5)]);
 
         assert!(
             transport.max_in_flight() <= PR_DETAIL_FETCH_CONCURRENCY,

@@ -193,7 +193,17 @@ async fn run_poll_cycle(
         );
 
         // Fetch GraphQL detail, then remove stale team-only hits before store replacement.
-        let prs = fetch_pr_details(client, &results).await?;
+        let fetch = fetch_pr_details(client, &results).await?;
+        // Transient detail-fetch failures must not erase healthy PRs: the
+        // store update below replaces the whole snapshot, so re-insert the
+        // previously stored copy of each failed PR (still subject to the
+        // provenance gate like everything else).
+        let prs = {
+            let s = store.read().await;
+            retain_stored_prs_for_failed_fetches(fetch.prs, &fetch.failed, |slug| {
+                s.get_by_slug(slug).cloned()
+            })
+        };
         let current_user = {
             let s = store.read().await;
             s.current_user.clone()
@@ -321,6 +331,24 @@ async fn run_poll_cycle(
     info!("Poll cycle completed in {:?}", start.elapsed());
 
     Ok(())
+}
+
+/// Re-insert the previously stored copy of each PR whose detail fetch failed
+/// transiently, so a whole-snapshot store replacement does not erase it.
+/// PRs with no stored copy (first sighting) are skipped — there is nothing
+/// to preserve.
+fn retain_stored_prs_for_failed_fetches(
+    mut prs: Vec<PullRequest>,
+    failed: &[(String, String, u64)],
+    lookup_stored: impl Fn(&str) -> Option<PullRequest>,
+) -> Vec<PullRequest> {
+    for (owner, repo, number) in failed {
+        let slug = format!("{}~{}~{}", owner, repo, number);
+        if let Some(existing) = lookup_stored(&slug) {
+            prs.push(existing);
+        }
+    }
+    prs
 }
 
 fn llm_classification_candidates<'a>(
@@ -489,5 +517,39 @@ mod tests {
             llm_rich_summary: None,
             last_seen_at: None,
         }
+    }
+
+    // Regression (review finding): a transient detail-fetch failure must not
+    // erase a previously healthy PR when the store snapshot is replaced.
+    #[test]
+    fn failed_detail_fetch_keeps_previously_stored_pr_through_store_update() {
+        let mut store = crate::daemon::store::PrStore::new("me".into());
+        let mut existing = make_pr("keepme", None, None);
+        existing.owner = "myorg".into();
+        existing.repo = "repo".into();
+        existing.number = 7;
+        let slug = existing.slug();
+        store.update_prs(vec![existing.clone()]);
+        store.set_diff(slug.clone(), "diff".into());
+
+        // The poll cycle hydrated zero PRs because this PR's fetch failed.
+        let snapshot = retain_stored_prs_for_failed_fetches(
+            Vec::new(),
+            &[("myorg".into(), "repo".into(), 7)],
+            |lookup_slug| store.get_by_slug(lookup_slug).cloned(),
+        );
+        assert_eq!(snapshot.len(), 1);
+
+        store.update_prs(snapshot);
+        assert!(store.get_by_slug(&slug).is_some());
+        assert_eq!(store.get_diff(&slug).map(String::as_str), Some("diff"));
+
+        // A failed key with no stored copy is simply skipped.
+        let snapshot = retain_stored_prs_for_failed_fetches(
+            Vec::new(),
+            &[("myorg".into(), "repo".into(), 99)],
+            |lookup_slug| store.get_by_slug(lookup_slug).cloned(),
+        );
+        assert!(snapshot.is_empty());
     }
 }
