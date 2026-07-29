@@ -68,8 +68,6 @@ pub struct LlmConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiConfig {
-    #[serde(default = "default_diff_style")]
-    pub diff_style: String,
     #[serde(default = "default_show_line_numbers")]
     pub show_line_numbers: bool,
 }
@@ -123,7 +121,6 @@ impl Default for LlmConfig {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            diff_style: default_diff_style(),
             show_line_numbers: default_show_line_numbers(),
         }
     }
@@ -147,10 +144,6 @@ fn default_classify_on_change() -> bool {
 
 fn default_llm_max_output_tokens() -> u32 {
     4096
-}
-
-fn default_diff_style() -> String {
-    "unified".to_string()
 }
 
 fn default_show_line_numbers() -> bool {
@@ -375,8 +368,6 @@ classify_on_change = true
 max_output_tokens = 4096
 
 [tui]
-# Diff style: "unified" or "side-by-side"
-diff_style = "unified"
 # Show line numbers in diff view
 show_line_numbers = true
 "#
@@ -393,7 +384,6 @@ mod tests {
         assert_eq!(config.daemon.port, 17890);
         assert!(!config.llm.enabled);
         assert_eq!(config.llm.max_output_tokens, 4096);
-        assert_eq!(config.tui.diff_style, "unified");
         assert!(config.tui.show_line_numbers);
     }
 

@@ -273,7 +273,6 @@ fn config_lines(ctx: &RenderContext) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     section(&mut lines, "TUI config");
-    lines.push(label_value("diff style", &config.tui.diff_style));
     lines.push(label_value(
         "show line numbers",
         bool_label(config.tui.show_line_numbers),

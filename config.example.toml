@@ -26,7 +26,5 @@ classify_on_change = true
 max_output_tokens = 4096
 
 [tui]
-# Diff style: "unified" or "side-by-side"
-diff_style = "unified"
 # Show line numbers in diff view
 show_line_numbers = true

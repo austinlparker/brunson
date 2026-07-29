@@ -4,30 +4,32 @@ use std::path::PathBuf;
 const LONG_ABOUT: &str = r#"brunson is a terminal PR manager with a daemon/TUI split.
 
 Quick start:
-  brunson setup              # interactive first-time setup
-  brunson daemon             # start the background daemon
-  brunson tui                # start the TUI (auto-spawns daemon if needed)
+  brunson tui                # start the TUI (auto-spawns daemon if needed);
+                             # a setup wizard opens automatically on first
+                             # run, and 'w' reopens it any time
+  brunson daemon             # start the background daemon on its own
 
 The daemon exposes a local HTTP API on http://127.0.0.1:17890 by default.
 Query /health for status and /setup/status for diagnostics.
 
 For agents or non-interactive installs:
-  brunson setup --yes --json # write a default config and print a
-                             # machine-readable summary with config
-                             # advice and prompts
+  brunson setup --yes        # ensure a default config file exists
+  brunson setup --yes --json # same, plus a machine-readable summary with
+                             # config advice and prompts
 
 Run `brunson setup --help` for details.
 "#;
 
-const SETUP_LONG_ABOUT: &str = r#"Interactive setup wizard.
+const SETUP_LONG_ABOUT: &str = r#"Non-interactive setup for scripts and agents.
 
-Creates ~/.config/brunson/config.toml, validates GitHub authentication,
-and tests LLM reachability if enabled.
+Ensures ~/.config/brunson/config.toml exists, validates GitHub
+authentication, and tests LLM reachability if enabled. Requires --yes or
+--json; interactive setup lives in the TUI (`brunson tui` opens the wizard
+on first run, and 'w' reopens it any time).
 
 Examples:
-  brunson setup              # interactive prompts
-  brunson setup --yes        # non-interactive: ensure default config exists
-  brunson setup --yes --json # non-interactive, machine-readable summary
+  brunson setup --yes        # ensure default config exists, print summary
+  brunson setup --yes --json # machine-readable summary
 
 `--json` is intended for agents. It returns a JSON object with:
   - ready/status: a quick readiness check
@@ -36,9 +38,8 @@ Examples:
   - advice: what to tell or ask the user
   - prompts: a list of missing config fields, with descriptions and examples
 
-If a daemon is already running on the configured port, `brunson setup`
-sends it /config/reload when it finishes so the new config takes effect
-immediately.
+Setup does not signal a running daemon. After editing the config, POST
+/config/reload to the daemon (or restart it) so the changes take effect.
 "#;
 
 #[derive(Parser)]
@@ -61,7 +62,7 @@ pub enum Commands {
     Daemon,
     /// Run the TUI client (auto-spawns daemon if needed)
     Tui,
-    /// Interactive setup: write config, validate auth, and test LLM reachability
+    /// Non-interactive setup (--yes/--json): write config, validate auth, test LLM reachability
     #[command(long_about = SETUP_LONG_ABOUT)]
     Setup(SetupArgs),
 }

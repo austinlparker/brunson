@@ -49,20 +49,21 @@ cargo install --path .
 ## Quick Start
 
 ```bash
-# Interactive setup: writes config, validates GitHub auth, and tests LLM reachability
-brunson setup
+# Start the TUI. It auto-spawns the daemon if needed, and on first run it
+# opens an interactive setup wizard (press 'w' to reopen it any time).
+brunson tui
 
 # Non-interactive / agent install: ensure config dir and default config exist
 brunson setup --yes
 
-# Start the daemon (runs in foreground)
-brunson daemon
+# Agent-readable setup summary (readiness, advice, and config prompts)
+brunson setup --yes --json
 
-# In another terminal, start the TUI
-brunson tui
+# Or run the daemon on its own (foreground)
+brunson daemon
 ```
 
-The TUI will auto-detect or spawn the daemon if it's not running. If the daemon is already running when you finish `brunson setup`, the setup wizard will send `/config/reload` so the new config takes effect immediately.
+Interactive setup lives entirely in the TUI wizard; `brunson setup` without `--yes`/`--json` exits with an error pointing you there. After editing the config by hand, POST `/config/reload` to a running daemon (or restart it) so the changes take effect.
 
 ## Configuration
 
@@ -95,7 +96,6 @@ classify_on_change = true
 max_output_tokens = 4096  # increase for reasoning-heavy local models
 
 [tui]
-diff_style = "unified"       # or "side-by-side"
 show_line_numbers = true
 ```
 
@@ -126,6 +126,7 @@ The TUI uses a five-blade horizontal dashboard (Inbox → Overview → Activity 
 | `/` | Filter inbox |
 | `o` | Open selected PR in browser |
 | `R` | Refresh from GitHub |
+| `w` | Open the setup wizard (also opens automatically on first run) |
 | `?` | Show help |
 | `q` | Quit |
 

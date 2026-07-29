@@ -77,17 +77,29 @@ curl -s http://localhost:17890/health | jq .refresh_in_progress
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Daemon status + cached `setup_status`/`setup_message` |
+| GET | `/health` | Daemon status + cached `setup_status`/`setup_message` + `binary_mtime` |
 | GET | `/setup/status` | Full machine-readable setup diagnostics |
-| POST | `/config/reload` | Re-parse `config.toml` from disk and apply changes |
-| GET | `/prs` | All PRs grouped by state |
-| GET | `/prs/{id}` | Full PR detail (checks, comments, files) |
-| GET | `/prs/{id}/diff` | Raw unified diff |
-| POST | `/prs/refresh` | Trigger immediate GitHub poll (returns 202) |
-| POST | `/prs/{id}/classify` | Re-run LLM classification (returns 202 or 503) |
+| GET | `/setup/memberships` | Viewer's org/team memberships (feeds the TUI wizard's team picker) |
 | GET | `/config` | Effective config, redacted (no secrets) |
 | GET | `/config/preview` | Generated GitHub search queries for the current config |
+| POST | `/config/preview_counts` | Run a proposed config's queries and report distinct matched PR counts |
 | POST | `/config/validate` | Validate a proposed config and preview generated queries |
+| POST | `/config/reload` | Re-parse `config.toml` from disk and apply changes |
+| GET | `/prs` | All PRs grouped by state |
+| POST | `/prs/refresh` | Trigger immediate GitHub poll (returns 202) |
+| GET | `/prs/{id}` | Full PR detail (checks, comments, files) |
+| GET | `/prs/{id}/diff` | Raw unified diff |
+| POST | `/prs/{id}/classify` | Re-run LLM classification (returns 202 or 503) |
+| POST | `/prs/{id}/seen` | Mark a PR as seen (records `last_seen_at` for catch-up summaries) |
+| POST | `/shutdown` | Gracefully stop the daemon |
+
+## Stale-Daemon Auto-Restart
+
+`/health` includes `binary_mtime`: the modification time (unix seconds) of the daemon's own executable at startup, or `null` when unreadable. The TUI compares it against its own executable's mtime; when the running daemon was started from an older build of the same binary (e.g. left over from before a `cargo build`), the TUI gracefully retires it (`POST /shutdown`) and respawns a fresh daemon. Agents can use the same field to detect a pre-upgrade daemon.
+
+## Setup Surfaces
+
+Brunson has two setup interfaces over one shared diagnostics core (`evaluate_setup`, which produces a structured list of setup issues): the agent-led path (`brunson setup --yes/--json` plus the `/setup/status` HTTP endpoint) and the human-led TUI wizard (`brunson tui` opens it on first run; `w` reopens it). The `--json` output's `next_steps`, `advice`, and `prompts` fields and the wizard's guidance are all derived from that same issue model, so the surfaces cannot drift apart.
 
 ## Agent-Driven Setup Workflow
 

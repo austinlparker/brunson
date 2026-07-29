@@ -286,7 +286,9 @@ async fn handle_pr_diff(State(state): State<Arc<AppState>>, Path(id): Path<Strin
 
     match client.get_pr_diff(&owner, &repo, number).await {
         Ok(diff) => {
-            // Cap diff size to prevent excessive memory usage
+            // Cap the served diff size to protect the TUI from parsing and
+            // rendering enormous diffs (the body is already fully in memory
+            // here, so this is not a daemon memory guard).
             let max_diff_bytes = 5_000_000; // 5 MB limit
             if diff.len() > max_diff_bytes {
                 let msg = format!(
