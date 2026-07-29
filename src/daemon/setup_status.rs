@@ -5,7 +5,7 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 
 use crate::api::{AuthStatus, LlmSetupStatus, SetupStatusResponse};
-use crate::config::{config_file_path, Config, LlmConfig};
+use crate::config::{config_file_path, default_endpoint_for_provider, Config, LlmConfig};
 use crate::github::auth::{resolve_host, resolve_token};
 use crate::github::client::GitHubClient;
 use crate::github::graphql::fetch_viewer_login;
@@ -61,88 +61,140 @@ fn token_source() -> Option<String> {
     Some("gh".to_string())
 }
 
-/// Run lightweight setup diagnostics against the current configuration.
-pub async fn evaluate_setup(
-    _config: &Config,
-    config_path: Option<&Path>,
-    auth: &dyn SetupAuth,
-) -> SetupStatusResponse {
+/// One actionable setup problem. This single structured model feeds every
+/// setup surface: the `next_steps` strings of `/setup/status` and the
+/// `prompts`/`advice` fields of `brunson setup --json` are both derived
+/// from it.
+#[derive(Debug, Clone)]
+pub struct SetupIssue {
+    /// Config-shaped field identifier, e.g. "github.auth", "llm.api_key".
+    pub field: String,
+    pub description: String,
+    pub current_value: Option<String>,
+    pub example: String,
+    /// One actionable sentence.
+    pub advice: String,
+}
+
+/// Result of setup diagnostics: the wire-shaped status plus the structured
+/// issues it was derived from. `/setup/status` serializes only `status`.
+#[derive(Debug, Clone)]
+pub struct SetupDiagnostics {
+    pub status: SetupStatusResponse,
+    pub issues: Vec<SetupIssue>,
+}
+
+/// One next-step line per issue, plus the start hint when everything is ready.
+fn next_steps_from(issues: &[SetupIssue], ready: bool) -> Vec<String> {
+    let mut steps: Vec<String> = issues.iter().map(|issue| issue.advice.clone()).collect();
+    if ready && steps.is_empty() {
+        steps.push(
+            "Run `brunson daemon` (if it is not already running) and `brunson tui` to start."
+                .to_string(),
+        );
+    }
+    steps
+}
+
+fn config_file_diagnostics(issue: SetupIssue) -> SetupDiagnostics {
+    let issues = vec![issue];
+    SetupDiagnostics {
+        status: SetupStatusResponse {
+            ready: false,
+            status: "missing_config".to_string(),
+            auth: AuthStatus::default(),
+            llm: LlmSetupStatus::default(),
+            next_steps: next_steps_from(&issues, false),
+        },
+        issues,
+    }
+}
+
+/// Run lightweight setup diagnostics against the on-disk configuration.
+pub async fn evaluate_setup(config_path: Option<&Path>, auth: &dyn SetupAuth) -> SetupDiagnostics {
     let resolved_path: PathBuf = config_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| config_file_path().unwrap_or_default());
 
     if resolved_path.as_os_str().is_empty() || !resolved_path.exists() {
-        return SetupStatusResponse {
-            ready: false,
-            status: "missing_config".to_string(),
-            auth: AuthStatus::default(),
-            llm: LlmSetupStatus::default(),
-            next_steps: vec![format!(
-                "Run `brunson setup` to create {}",
+        return config_file_diagnostics(SetupIssue {
+            field: "config_file".to_string(),
+            description: "The brunson configuration file path.".to_string(),
+            current_value: Some(resolved_path.display().to_string()),
+            example: "~/.config/brunson/config.toml".to_string(),
+            advice: format!(
+                "No brunson config file exists. Run `brunson setup --yes` to create {}.",
                 resolved_path.display()
-            )],
-        };
+            ),
+        });
     }
 
     // Validate that the on-disk config can be parsed.
     let config = match Config::load(Some(&resolved_path)) {
         Ok(c) => c,
         Err(e) => {
-            return SetupStatusResponse {
-                ready: false,
-                status: "missing_config".to_string(),
-                auth: AuthStatus::default(),
-                llm: LlmSetupStatus::default(),
-                next_steps: vec![format!(
-                    "Config file at {} is invalid: {}. Run `brunson setup` to fix it.",
+            return config_file_diagnostics(SetupIssue {
+                field: "config_file".to_string(),
+                description: "The brunson configuration file could not be parsed.".to_string(),
+                current_value: Some(resolved_path.display().to_string()),
+                example: "~/.config/brunson/config.toml".to_string(),
+                advice: format!(
+                    "Config file at {} is invalid: {}. Fix the TOML, or delete it and run `brunson setup --yes` to regenerate it.",
                     resolved_path.display(),
                     e
-                )],
-            };
+                ),
+            });
         }
     };
 
+    let mut issues: Vec<SetupIssue> = Vec::new();
+
     // Check GitHub auth.
-    let (auth, mut next_steps) = match auth.resolve_token() {
+    let auth_status = match auth.resolve_token() {
         Ok(token) => {
             let host = resolve_host();
             match auth.viewer_login(&token, &host).await {
-                Ok(user) => {
-                    let auth = AuthStatus {
+                Ok(user) => AuthStatus {
+                    resolved: true,
+                    source: token_source(),
+                    user: Some(user),
+                },
+                Err(e) => {
+                    issues.push(SetupIssue {
+                        field: "github.auth".to_string(),
+                        description: "GitHub personal access token or gh CLI authentication."
+                            .to_string(),
+                        current_value: token_source(),
+                        example: "gh auth login  (or export GH_TOKEN=ghp_xxx)".to_string(),
+                        advice: format!(
+                            "GitHub token resolved but viewer login failed: {}. Check GH_HOST and token scopes.",
+                            e
+                        ),
+                    });
+                    AuthStatus {
                         resolved: true,
                         source: token_source(),
-                        user: Some(user),
-                    };
-                    (auth, Vec::new())
-                }
-                Err(e) => {
-                    let mut steps = Vec::new();
-                    steps.push(format!(
-                        "GitHub token resolved but viewer login failed: {}. Check GH_HOST and token scopes.",
-                        e
-                    ));
-                    (
-                        AuthStatus {
-                            resolved: true,
-                            source: token_source(),
-                            user: None,
-                        },
-                        steps,
-                    )
+                        user: None,
+                    }
                 }
             }
         }
         Err(e) => {
-            let mut steps = Vec::new();
-            steps.push(format!(
-                "GitHub auth is missing or invalid: {}. Run `gh auth login` or set GH_TOKEN.",
-                e
-            ));
-            (AuthStatus::default(), steps)
+            issues.push(SetupIssue {
+                field: "github.auth".to_string(),
+                description: "GitHub personal access token or gh CLI authentication.".to_string(),
+                current_value: None,
+                example: "gh auth login  (or export GH_TOKEN=ghp_xxx)".to_string(),
+                advice: format!(
+                    "GitHub auth is missing or invalid: {}. Run `gh auth login` or set GH_TOKEN.",
+                    e
+                ),
+            });
+            AuthStatus::default()
         }
     };
 
-    let mut status = if auth.resolved && auth.user.is_some() {
+    let mut status = if auth_status.resolved && auth_status.user.is_some() {
         "ready".to_string()
     } else {
         "missing_auth".to_string()
@@ -166,13 +218,37 @@ pub async fn evaluate_setup(
             Err(e) => {
                 llm.reachable = Some(false);
                 llm.message = Some(format!("LLM check failed: {}", e));
-                if config.llm.enabled {
-                    status = "llm_misconfigured".to_string();
-                    next_steps.push(
-                        "LLM is enabled but unreachable. Check endpoint and api_key in [llm]."
-                            .to_string(),
-                    );
+                status = "llm_misconfigured".to_string();
+                if config.llm.provider == "openai_compatible" && config.llm.api_key.is_empty() {
+                    issues.push(SetupIssue {
+                        field: "llm.api_key".to_string(),
+                        description: "API key for the OpenAI-compatible endpoint.".to_string(),
+                        current_value: None,
+                        example: "export OPENAI_API_KEY=sk-xxx".to_string(),
+                        advice: "LLM is enabled but [llm] api_key is empty. Set the API key for the OpenAI-compatible endpoint.".to_string(),
+                    });
                 }
+                if config.llm.model.is_empty() {
+                    issues.push(SetupIssue {
+                        field: "llm.model".to_string(),
+                        description: "Model name to use for classification.".to_string(),
+                        current_value: Some("(auto-detect)".to_string()),
+                        example: "gpt-4o-mini".to_string(),
+                        advice: "No [llm] model is set and auto-detection failed. Set the model explicitly.".to_string(),
+                    });
+                }
+                issues.push(SetupIssue {
+                    field: "llm.endpoint".to_string(),
+                    description: "OpenAI-compatible endpoint URL.".to_string(),
+                    current_value: Some(if config.llm.endpoint.is_empty() {
+                        default_endpoint_for_provider(&config.llm.provider).to_string()
+                    } else {
+                        config.llm.endpoint.clone()
+                    }),
+                    example: "https://api.openai.com/v1".to_string(),
+                    advice: "LLM is enabled but unreachable. Check endpoint and api_key in [llm]."
+                        .to_string(),
+                });
             }
         }
     } else {
@@ -180,23 +256,31 @@ pub async fn evaluate_setup(
     }
 
     let ready = status == "ready"
-        && auth.resolved
-        && auth.user.is_some()
+        && auth_status.resolved
+        && auth_status.user.is_some()
         && (!config.llm.enabled || llm.reachable == Some(true));
 
-    if ready && next_steps.is_empty() {
-        next_steps.push(
-            "Run `brunson daemon` (if it is not already running) and `brunson tui` to start."
-                .to_string(),
-        );
+    if !ready && config.github.watch.is_empty() {
+        issues.push(SetupIssue {
+            field: "github.watch".to_string(),
+            description:
+                "Repositories/orgs to watch. Empty means every PR involving the authenticated user."
+                    .to_string(),
+            current_value: Some("(all repos)".to_string()),
+            example: "[\"myorg\", \"myorg/important-repo\"]".to_string(),
+            advice: "github.watch is empty, so every PR involving the authenticated user is tracked. Add repos/orgs to narrow the scope (optional).".to_string(),
+        });
     }
 
-    SetupStatusResponse {
-        ready,
-        status: if ready { "ready".to_string() } else { status },
-        auth,
-        llm,
-        next_steps,
+    SetupDiagnostics {
+        status: SetupStatusResponse {
+            ready,
+            status: if ready { "ready".to_string() } else { status },
+            auth: auth_status,
+            llm,
+            next_steps: next_steps_from(&issues, ready),
+        },
+        issues,
     }
 }
 

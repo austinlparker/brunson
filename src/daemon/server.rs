@@ -110,12 +110,9 @@ async fn handle_setup_status(State(state): State<Arc<AppState>>) -> Json<SetupSt
         }
     }
 
-    let result = evaluate_setup(
-        &state.latest_config(),
-        state.config_path.as_deref(),
-        state.auth.as_ref(),
-    )
-    .await;
+    let result = evaluate_setup(state.config_path.as_deref(), state.auth.as_ref())
+        .await
+        .status;
 
     {
         let mut cache = state.setup_cache.write().await;
@@ -753,12 +750,9 @@ async fn handle_config_reload(
     }
 
     // Refresh setup cache so /health immediately reflects the new config.
-    let refreshed = evaluate_setup(
-        &new_config,
-        state.config_path.as_deref(),
-        state.auth.as_ref(),
-    )
-    .await;
+    let refreshed = evaluate_setup(state.config_path.as_deref(), state.auth.as_ref())
+        .await
+        .status;
     {
         let mut cache = state.setup_cache.write().await;
         cache.cached_at = Some(std::time::Instant::now());
