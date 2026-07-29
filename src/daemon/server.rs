@@ -151,6 +151,12 @@ async fn handle_prs(State(state): State<Arc<AppState>>) -> Json<PrListResponse> 
                 updated_at: pr.updated_at.clone(),
                 url: pr.url.clone(),
                 comments: s.comment_count(pr),
+                head_ref: pr.head_ref.clone(),
+                llm_one_line: pr
+                    .llm_rich_summary
+                    .as_ref()
+                    .map(|r| r.one_line.clone())
+                    .or_else(|| pr.llm_summary.clone()),
             })
             .collect();
         groups.insert(group, summaries);
@@ -244,6 +250,8 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
                         body: c.body.clone(),
                         path: c.path.clone(),
                         line: c.line,
+                        created_at: c.created_at.clone(),
+                        url: c.url.clone(),
                     })
                     .collect(),
             })
@@ -266,6 +274,7 @@ async fn handle_pr_detail(State(state): State<Arc<AppState>>, Path(id): Path<Str
                 actor: e.actor.clone(),
                 created_at: e.created_at.clone(),
                 detail: e.detail.clone(),
+                url: e.url.clone(),
             })
             .collect(),
         llm_priority: pr.llm_priority,
@@ -1138,6 +1147,91 @@ mod tests {
         let groups = json["groups"].as_object().unwrap();
         // The PR should be in some group
         assert!(!groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_summary_includes_head_ref_and_one_line() {
+        let mut prs = make_test_prs();
+        prs[0].llm_summary = Some("Fallback summary".into());
+        let mut store = PrStore::new("me".into());
+        store.update_prs(prs);
+        let state = make_test_state(store);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/prs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let summary = json["groups"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|v| v.as_array().unwrap())
+            .next()
+            .expect("at least one summary");
+        assert_eq!(summary["head_ref"], "feature");
+        // No rich summary set → falls back to llm_summary.
+        assert_eq!(summary["llm_one_line"], "Fallback summary");
+    }
+
+    #[tokio::test]
+    async fn pr_detail_maps_comment_created_at_and_url() {
+        let mut prs = make_test_prs();
+        prs[0].review_threads = vec![crate::github::types::ReviewThread {
+            is_resolved: false,
+            is_outdated: false,
+            comments: vec![crate::github::types::ReviewComment {
+                author: "bob".into(),
+                body: "fix this".into(),
+                path: "src/main.rs".into(),
+                line: Some(3),
+                created_at: "2024-05-01T10:00:00Z".into(),
+                url: "https://github.com/org/repo/pull/42#discussion_r1".into(),
+            }],
+        }];
+        prs[0].timeline = vec![crate::github::types::TimelineEvent {
+            event_type: crate::github::types::TimelineEventType::Comment,
+            actor: "bob".into(),
+            created_at: "2024-05-01T10:00:00Z".into(),
+            detail: "hello".into(),
+            url: "https://github.com/org/repo/pull/42#issuecomment-1".into(),
+        }];
+        let mut store = PrStore::new("me".into());
+        store.update_prs(prs);
+        let state = make_test_state(store);
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/prs/org~repo~42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let comment = &json["review_threads"][0]["comments"][0];
+        assert_eq!(comment["created_at"], "2024-05-01T10:00:00Z");
+        assert_eq!(
+            comment["url"],
+            "https://github.com/org/repo/pull/42#discussion_r1"
+        );
+        assert_eq!(
+            json["timeline"][0]["url"],
+            "https://github.com/org/repo/pull/42#issuecomment-1"
+        );
     }
 
     #[tokio::test]

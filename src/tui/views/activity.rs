@@ -11,7 +11,9 @@ use crate::tui::render::theme::{ACTIVITY, ADD, DRAFT, FAIL, MANTLE, MUTED, OVERV
 
 pub fn render_activity(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     fill(f, area, MANTLE);
-    let lines = &ctx.state.render_cache.activity_lines;
+    // Flattened in `ViewStateManager::prepare` (`flatten_activity_events`)
+    // from the cached structured events, with selection/collapse applied.
+    let lines = &ctx.view.activity_display_lines;
     if lines.is_empty() {
         f.render_widget(
             ratatui::widgets::Paragraph::new(Line::from(vec![Span::styled(

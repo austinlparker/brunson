@@ -491,6 +491,8 @@ diff --git a/b.rs b/b.rs
                     body: "comment in a".into(),
                     path: "a.rs".into(),
                     line: Some(2),
+                    created_at: String::new(),
+                    url: String::new(),
                 }],
             },
             ReviewThreadDto {
@@ -501,6 +503,8 @@ diff --git a/b.rs b/b.rs
                     body: "comment in b".into(),
                     path: "b.rs".into(),
                     line: Some(2),
+                    created_at: String::new(),
+                    url: String::new(),
                 }],
             },
         ];
@@ -537,6 +541,8 @@ diff --git a/b.rs b/b.rs
                 body: "needs fix".into(),
                 path: "a.rs".into(),
                 line: Some(99),
+                created_at: String::new(),
+                url: String::new(),
             }],
         }];
         let map = map_review_threads_to_diff_indices(&threads, &lines);

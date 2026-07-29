@@ -24,7 +24,7 @@ use crate::tui::render::chrome::InlineToast;
 use crate::tui::render::component::{Component, RenderContext};
 use crate::tui::render::layout::{Blade, RootLayout};
 use crate::tui::render::theme::Theme;
-use crate::tui::state::{InboxCursor, InboxRow, InboxSection, ViewStateManager};
+use crate::tui::state::{InboxCursor, InboxRow, InboxSection, ViewState, ViewStateManager};
 use crate::tui::wizard::{self, SetupWizardState, WizardStep};
 
 /// Action returned by key handling for the render loop.
@@ -172,7 +172,14 @@ pub struct AppState {
     pub diff_loading: bool,
     /// Cached render artifacts (overview/activity/diff lines).
     pub render_cache: RenderCache,
+    /// Clipboard sink. Defaults to the real OS clipboard
+    /// (`copy_to_clipboard`); tests inject a recorder so the exact copied
+    /// text is assertable.
+    pub clipboard: ClipboardFn,
 }
+
+/// Injectable clipboard sink (see `AppState::clipboard`).
+type ClipboardFn = Box<dyn Fn(&str) -> std::result::Result<(), String> + Send>;
 
 impl AppState {
     pub fn new(config: Config, client: DaemonClient) -> Self {
@@ -213,6 +220,7 @@ impl AppState {
             llm_detail_loading: false,
             diff_loading: false,
             render_cache: RenderCache::new(),
+            clipboard: Box::new(copy_to_clipboard),
         }
     }
 
@@ -504,6 +512,20 @@ impl AppState {
         }
     }
 
+    /// Which optional Overview sections are visible (Summary, Problems), per
+    /// the same presence rules as `overview_section_layout`. Drives Tab focus
+    /// cycling over the visible section list.
+    fn overview_section_visibility(&self) -> (bool, bool) {
+        let summary_len = crate::tui::views::overview::effective_summary_len(
+            self.render_cache.overview_summary.len(),
+            crate::tui::views::overview::summary_loading(self),
+        );
+        (
+            summary_len > 0,
+            !self.render_cache.overview_problems.is_empty(),
+        )
+    }
+
     /// Open the PR in the browser.
     pub fn open_pr_in_browser(&mut self) {
         if let Some(detail) = &self.pr_detail {
@@ -511,22 +533,92 @@ impl AppState {
         }
     }
 
-    /// Copy the selected PR's source branch to the system clipboard.
+    /// URL for the selected Activity event: the event's own URL when it has
+    /// one, else the PR URL. `None` when there are no events (or no PR).
+    fn selected_activity_url(&self, view: &ViewState) -> Option<String> {
+        let event = self
+            .render_cache
+            .activity_events
+            .get(view.activity_selected)?;
+        if !event.url.is_empty() {
+            return Some(event.url.clone());
+        }
+        self.pr_detail
+            .as_ref()
+            .map(|d| d.url.clone())
+            .or_else(|| self.selected_summary().map(|s| s.url))
+    }
+
+    /// Toggle the selected Activity event between collapsed and expanded.
+    /// A no-op on an empty event list.
+    fn toggle_activity_expansion(&mut self, view: &mut ViewStateManager) {
+        if self.render_cache.activity_events.is_empty() {
+            return;
+        }
+        let idx = view.view.activity_selected;
+        if !view.view.activity_expanded.remove(&idx) {
+            view.view.activity_expanded.insert(idx);
+        }
+    }
+
+    /// Move the Activity event selection by `delta`, clamped to the list.
+    fn move_activity_selection(&mut self, view: &mut ViewStateManager, delta: i32) {
+        let count = self.render_cache.activity_events.len();
+        if count == 0 {
+            return;
+        }
+        let current = view.view.activity_selected as i32;
+        view.view.activity_selected = (current + delta).clamp(0, count as i32 - 1) as usize;
+    }
+
+    /// Copy the selected Activity event's full raw body to the clipboard.
+    fn copy_selected_activity_body(&mut self, view: &ViewStateManager) {
+        let Some(event) = self
+            .render_cache
+            .activity_events
+            .get(view.view.activity_selected)
+        else {
+            self.set_transient_message("Nothing to copy".to_string());
+            return;
+        };
+        if event.raw_body.trim().is_empty() {
+            self.set_transient_message("Nothing to copy".to_string());
+            return;
+        }
+        let raw_body = event.raw_body.clone();
+        let actor = event.actor.clone();
+        match (self.clipboard)(&raw_body) {
+            Ok(()) => {
+                self.set_transient_message(format!("Copied comment from @{actor}"));
+            }
+            Err(error) => {
+                self.error_message = Some(format!("Copy comment failed: {error}"));
+            }
+        }
+    }
+
+    /// Copy the selected PR's source branch to the system clipboard. Prefers
+    /// the loaded detail's `head_ref`, falling back to the selected list
+    /// summary's `head_ref` so `^y` works before the detail response arrives
+    /// (the summary field is empty when talking to an older daemon).
     fn copy_selected_branch(&mut self) {
-        let Some(branch) = self
+        let branch = self
             .pr_detail
             .as_ref()
             .map(|detail| detail.head_ref.trim().to_string())
             .filter(|branch| !branch.is_empty())
-        else {
-            self.error_message = Some(
-                "Copy branch failed: PR details are still loading or no branch is available"
-                    .to_string(),
-            );
+            .or_else(|| {
+                self.selected_summary()
+                    .map(|summary| summary.head_ref.trim().to_string())
+                    .filter(|branch| !branch.is_empty())
+            });
+        let Some(branch) = branch else {
+            self.error_message =
+                Some("Copy branch failed: no branch is available for the selected PR".to_string());
             return;
         };
 
-        match copy_to_clipboard(&branch) {
+        match (self.clipboard)(&branch) {
             Ok(()) => {
                 self.set_transient_message(format!("Copied branch: {branch}"));
             }
@@ -614,6 +706,13 @@ impl AppState {
             KeyCode::Char('n') if view.view.active_blade == Blade::Diff => {
                 self.show_line_numbers = !self.show_line_numbers;
             }
+            // In the Activity blade, `o` opens the *selected event's* URL
+            // (falling back to the PR). `O` keeps opening the PR everywhere.
+            KeyCode::Char('o') if view.view.active_blade == Blade::Activity => {
+                if let Some(url) = self.selected_activity_url(&view.view) {
+                    let _ = open::that(&url);
+                }
+            }
             KeyCode::Char('o') | KeyCode::Char('O') => self.open_pr_in_browser(),
             KeyCode::Right | KeyCode::Char('l') => self.next_blade(view),
             KeyCode::Left | KeyCode::Char('h') => self.prev_blade(view),
@@ -639,7 +738,9 @@ impl AppState {
                     }
                 }
                 Blade::Overview => self.set_active_blade(view, Blade::Activity),
-                Blade::Activity => self.set_active_blade(view, Blade::Files),
+                // Enter toggles the selected event's expansion; `l`/`→` still
+                // navigate deeper to Files.
+                Blade::Activity => self.toggle_activity_expansion(view),
                 Blade::Files => self.open_selected_file_diff(view),
                 Blade::Diff => {}
             },
@@ -653,16 +754,21 @@ impl AppState {
             KeyCode::Char(' ') if view.view.active_blade == Blade::Inbox => {
                 self.toggle_collapse_current(view)
             }
-            KeyCode::Char('d') if view.view.active_blade == Blade::Overview => {
-                view.view.overview_description_expanded = !view.view.overview_description_expanded;
+            KeyCode::Char(' ') if view.view.active_blade == Blade::Activity => {
+                self.toggle_activity_expansion(view)
+            }
+            KeyCode::Char('y') if view.view.active_blade == Blade::Activity => {
+                self.copy_selected_activity_body(view)
             }
             KeyCode::Char('g') => self.jump_to_top(view),
             KeyCode::Char('G') => self.jump_to_bottom(view),
             KeyCode::Tab if view.view.active_blade == Blade::Overview => {
-                view.view.overview_focus = view.view.overview_focus.next();
+                let (has_summary, has_problems) = self.overview_section_visibility();
+                view.view.overview_focus = view.view.overview_focus.next(has_summary, has_problems);
             }
             KeyCode::BackTab if view.view.active_blade == Blade::Overview => {
-                view.view.overview_focus = view.view.overview_focus.prev();
+                let (has_summary, has_problems) = self.overview_section_visibility();
+                view.view.overview_focus = view.view.overview_focus.prev(has_summary, has_problems);
             }
             KeyCode::Tab if view.view.active_blade == Blade::Diff => self.jump_diff_file(view, 1),
             KeyCode::BackTab if view.view.active_blade == Blade::Diff => {
@@ -783,6 +889,7 @@ impl AppState {
         match view.view.active_blade {
             Blade::Inbox => self.set_selected_row(view, 0),
             Blade::Files => self.set_selected_file_index(view, 0),
+            Blade::Activity => view.view.activity_selected = 0,
             Blade::Diff => view.view.diff_scroll.scroll_to(0),
             _ => view.view.active_scroll_mut().scroll_to(0),
         }
@@ -800,6 +907,10 @@ impl AppState {
             Blade::Files => {
                 let last = self.selected_file_count().saturating_sub(1);
                 self.set_selected_file_index(view, last);
+            }
+            Blade::Activity => {
+                view.view.activity_selected =
+                    self.render_cache.activity_events.len().saturating_sub(1);
             }
             Blade::Diff => {
                 let max = view.view.diff_scroll.max_scroll();
@@ -835,6 +946,7 @@ impl AppState {
         match view.view.active_blade {
             Blade::Inbox => self.move_selection(view, 1),
             Blade::Files => self.move_file_selection(view, 1),
+            Blade::Activity => self.move_activity_selection(view, 1),
             Blade::Diff => {
                 view.view.diff_scroll.scroll_by(1);
                 self.sync_selected_file_to_diff_scroll(view);
@@ -847,6 +959,7 @@ impl AppState {
         match view.view.active_blade {
             Blade::Inbox => self.move_selection(view, -1),
             Blade::Files => self.move_file_selection(view, -1),
+            Blade::Activity => self.move_activity_selection(view, -1),
             Blade::Diff => {
                 view.view.diff_scroll.scroll_by(-1);
                 self.sync_selected_file_to_diff_scroll(view);
@@ -1727,6 +1840,8 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             url: "https://example.com".to_string(),
             comments: 0,
+            head_ref: String::new(),
+            llm_one_line: None,
         }
     }
 
@@ -1952,6 +2067,77 @@ mod tests {
             ),
         );
         assert_eq!(view.view.active_blade, Blade::Inbox);
+    }
+
+    #[test]
+    fn description_renders_all_lines_without_expand_marker() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
+        );
+        let mut state = make_test_state(groups);
+        state.selected_pr_id = Some("org~repo~1".to_string());
+
+        let backend = TestBackend::new(124, 34);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Overview;
+
+        // Settle the initial selection before injecting the detail (see
+        // `overview_frame_does_not_leak_inbox_content_after_blade_switch`).
+        terminal
+            .draw(|f| crate::tui::app::render_frame(f, &mut state, &mut view))
+            .unwrap();
+        state.detail_needs_reload = false;
+        state.diff_needs_reload = false;
+
+        let mut detail = make_detail("org~repo~1", "2024-01-01T00:00:00Z", None);
+        detail.body = (0..40)
+            .map(|i| format!("descline {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        state.pr_detail = Some(detail);
+
+        terminal
+            .draw(|f| crate::tui::app::render_frame(f, &mut state, &mut view))
+            .unwrap();
+
+        // Every description line is cached — nothing folded behind a marker.
+        assert!(
+            state.render_cache.overview_description.len() >= 40,
+            "cache holds the full description"
+        );
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("to expand"), "no expand marker: {text}");
+        assert!(!text.contains("more line"), "no more-lines marker");
+        assert!(text.contains("descline 0"), "description body is visible");
+
+        // The description scroll clamp covers the full content, so every
+        // line is reachable by scrolling.
+        let sc = &view.view.overview_description_scroll;
+        assert!(sc.viewport_height > 0);
+        assert_eq!(
+            sc.max_scroll(),
+            sc.content_height - sc.viewport_height,
+            "scroll reaches the last description line"
+        );
     }
 
     #[test]
@@ -2528,6 +2714,8 @@ mod tests {
                     updated_at: "2024-01-01T00:00:00Z".to_string(),
                     url: "https://example.com".to_string(),
                     comments: 0,
+                    head_ref: String::new(),
+                    llm_one_line: None,
                 })
                 .collect(),
         );
@@ -2543,12 +2731,13 @@ mod tests {
         view.prepare(&mut state, &layout);
 
         // Active blade content height is 25 (full-bleed body under a 5-row
-        // chrome); the Inbox blade reserves one row for its column header, so
-        // the scrollable viewport is 24 rows. With 30 PRs plus one section
-        // header there are 31 content lines; selecting the last PR (line index
-        // 30) should scroll so it is the last visible row.
+        // chrome); the Inbox blade reserves one row for its column header and
+        // two rows for the preview strip, so the scrollable viewport is 22
+        // rows. With 30 PRs plus one section header there are 31 content
+        // lines; selecting the last PR (line index 30) should scroll so it is
+        // the last visible row.
         assert_eq!(
-            view.view.inbox_scroll.offset, 7,
+            view.view.inbox_scroll.offset, 9,
             "inbox_scroll should follow selection to the last page"
         );
 
@@ -2609,9 +2798,28 @@ mod tests {
         assert_eq!(state.error_message.as_deref(), Some("persistent error"));
     }
 
+    /// Install a recording clipboard on `state`; the returned handle observes
+    /// the last copied text.
+    fn record_clipboard(state: &mut AppState) -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = recorded.clone();
+        state.clipboard = Box::new(move |text| {
+            *sink.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
+        recorded
+    }
+
     #[test]
-    fn ctrl_y_without_detail_reports_a_copy_error() {
-        let mut state = make_test_state(HashMap::new());
+    fn ctrl_y_falls_back_to_summary_head_ref() {
+        let mut groups = HashMap::new();
+        let mut summary = make_summary("org~repo~1", PrGroup::ReviewNeeded, "other", None);
+        summary.head_ref = "feature/from-summary".to_string();
+        groups.insert(PrGroup::ReviewNeeded, vec![summary]);
+        let mut state = make_test_state(groups);
+        state.selected_pr_id = Some("org~repo~1".to_string());
+        assert!(state.pr_detail.is_none(), "detail not yet loaded");
+        let recorded = record_clipboard(&mut state);
         let mut view = ViewStateManager::new();
 
         let action = state.handle_key(
@@ -2620,10 +2828,207 @@ mod tests {
         );
 
         assert_eq!(action, Action::None);
+        assert_eq!(
+            recorded.lock().unwrap().as_deref(),
+            Some("feature/from-summary")
+        );
+        assert!(state
+            .transient_message
+            .as_deref()
+            .is_some_and(|m| m.contains("feature/from-summary")));
+        assert!(state.error_message.is_none());
+    }
+
+    #[test]
+    fn ctrl_y_errors_when_no_branch_anywhere() {
+        // Old daemon: the summary carries no head_ref, and no detail is loaded.
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
+        );
+        let mut state = make_test_state(groups);
+        state.selected_pr_id = Some("org~repo~1".to_string());
+        let recorded = record_clipboard(&mut state);
+        let mut view = ViewStateManager::new();
+
+        let action = state.handle_key(
+            &mut view,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(action, Action::None);
+        assert!(recorded.lock().unwrap().is_none(), "nothing copied");
         assert!(state
             .error_message
             .as_deref()
             .is_some_and(|message| message.starts_with("Copy branch failed:")));
+    }
+
+    fn make_activity_event(
+        actor: &str,
+        raw_body: &str,
+        url: &str,
+    ) -> crate::tui::render::cache::ActivityEvent {
+        crate::tui::render::cache::ActivityEvent {
+            header_spans: vec![],
+            body: vec![],
+            raw_body: raw_body.to_string(),
+            url: url.to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            actor: actor.to_string(),
+        }
+    }
+
+    #[test]
+    fn activity_j_k_moves_between_events() {
+        let mut state = make_test_state(HashMap::new());
+        state.render_cache.activity_events = vec![
+            make_activity_event("a", "one", ""),
+            make_activity_event("b", "two", ""),
+            make_activity_event("c", "three", ""),
+        ];
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Activity;
+
+        state.handle_key(&mut view, key(KeyCode::Char('j')));
+        assert_eq!(view.view.activity_selected, 1);
+        state.handle_key(&mut view, key(KeyCode::Char('j')));
+        state.handle_key(&mut view, key(KeyCode::Char('j')));
+        assert_eq!(view.view.activity_selected, 2, "clamped at the last event");
+        state.handle_key(&mut view, key(KeyCode::Char('k')));
+        assert_eq!(view.view.activity_selected, 1);
+
+        // g/G select first/last event.
+        state.handle_key(&mut view, key(KeyCode::Char('G')));
+        assert_eq!(view.view.activity_selected, 2);
+        state.handle_key(&mut view, key(KeyCode::Char('g')));
+        assert_eq!(view.view.activity_selected, 0);
+
+        // On another blade, j does not touch the activity selection.
+        view.view.active_blade = Blade::Overview;
+        state.handle_key(&mut view, key(KeyCode::Char('j')));
+        assert_eq!(view.view.activity_selected, 0);
+    }
+
+    #[test]
+    fn activity_enter_toggles_expansion_not_blade() {
+        let mut state = make_test_state(HashMap::new());
+        state.render_cache.activity_events = vec![make_activity_event("a", "one", "")];
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Activity;
+
+        state.handle_key(&mut view, key(KeyCode::Enter));
+        assert_eq!(view.view.active_blade, Blade::Activity, "no blade change");
+        assert!(view.view.activity_expanded.contains(&0));
+
+        // Space toggles it back.
+        state.handle_key(&mut view, key(KeyCode::Char(' ')));
+        assert!(view.view.activity_expanded.is_empty());
+
+        // `l` still navigates deeper to Files.
+        state.handle_key(&mut view, key(KeyCode::Char('l')));
+        assert_eq!(view.view.active_blade, Blade::Files);
+
+        // Enter on Files keeps its old behavior (no expansion side effects).
+        view.view.active_blade = Blade::Inbox;
+        state.handle_key(&mut view, key(KeyCode::Char(' ')));
+        assert!(
+            view.view.activity_expanded.is_empty(),
+            "inbox space folds sections, not events"
+        );
+    }
+
+    #[test]
+    fn activity_y_copies_selected_event_body() {
+        let mut state = make_test_state(HashMap::new());
+        state.render_cache.activity_events = vec![
+            make_activity_event("alice", "first body", ""),
+            make_activity_event("bob", "second body", ""),
+        ];
+        let recorded = record_clipboard(&mut state);
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Activity;
+        view.view.activity_selected = 1;
+
+        state.handle_key(&mut view, key(KeyCode::Char('y')));
+
+        assert_eq!(recorded.lock().unwrap().as_deref(), Some("second body"));
+        assert!(state
+            .transient_message
+            .as_deref()
+            .is_some_and(|m| m.contains("@bob")));
+    }
+
+    #[test]
+    fn activity_y_on_empty_body_reports_nothing_to_copy() {
+        let mut state = make_test_state(HashMap::new());
+        state.render_cache.activity_events = vec![make_activity_event("alice", "   ", "")];
+        let recorded = record_clipboard(&mut state);
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Activity;
+
+        state.handle_key(&mut view, key(KeyCode::Char('y')));
+
+        assert!(recorded.lock().unwrap().is_none());
+        assert_eq!(state.transient_message.as_deref(), Some("Nothing to copy"));
+    }
+
+    #[test]
+    fn selected_activity_url_prefers_event_url_falls_back_to_pr() {
+        let mut state = make_test_state(HashMap::new());
+        state.pr_detail = Some(make_detail("org~repo~1", "2024-01-01T00:00:00Z", None));
+        state.render_cache.activity_events = vec![
+            make_activity_event(
+                "a",
+                "x",
+                "https://github.com/org/repo/pull/1#issuecomment-1",
+            ),
+            make_activity_event("b", "y", ""),
+        ];
+        let mut view = ViewStateManager::new();
+
+        view.view.activity_selected = 0;
+        assert_eq!(
+            state.selected_activity_url(&view.view).as_deref(),
+            Some("https://github.com/org/repo/pull/1#issuecomment-1")
+        );
+
+        // Event without a URL falls back to the PR URL.
+        view.view.activity_selected = 1;
+        assert_eq!(
+            state.selected_activity_url(&view.view).as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn activity_actions_noop_on_empty_event_list() {
+        let mut state = make_test_state(HashMap::new());
+        let recorded = record_clipboard(&mut state);
+        let mut view = ViewStateManager::new();
+        view.view.active_blade = Blade::Activity;
+
+        state.handle_key(&mut view, key(KeyCode::Char('j')));
+        state.handle_key(&mut view, key(KeyCode::Char('k')));
+        state.handle_key(&mut view, key(KeyCode::Char('g')));
+        state.handle_key(&mut view, key(KeyCode::Char('G')));
+        state.handle_key(&mut view, key(KeyCode::Enter));
+        state.handle_key(&mut view, key(KeyCode::Char(' ')));
+        assert_eq!(view.view.activity_selected, 0);
+        assert!(view.view.activity_expanded.is_empty());
+        assert_eq!(view.view.active_blade, Blade::Activity);
+        assert!(state.selected_activity_url(&view.view).is_none());
+
+        // `y` shows the transient "nothing to copy" instead of copying.
+        state.handle_key(&mut view, key(KeyCode::Char('y')));
+        assert!(recorded.lock().unwrap().is_none());
+        assert_eq!(state.transient_message.as_deref(), Some("Nothing to copy"));
     }
 
     #[test]
@@ -2780,15 +3185,23 @@ mod tests {
     }
 
     #[test]
-    fn d_toggles_overview_description_expansion() {
+    fn tab_cycles_overview_focus_over_visible_sections() {
+        use crate::tui::state::OverviewFocus;
+        // No summary, no problems: only Description and LastActivity cycle.
         let mut state = make_test_state(HashMap::new());
         let mut view = ViewStateManager::new();
         view.view.active_blade = Blade::Overview;
-        assert!(!view.view.overview_description_expanded);
-        state.handle_key(&mut view, key(KeyCode::Char('d')));
-        assert!(view.view.overview_description_expanded);
-        state.handle_key(&mut view, key(KeyCode::Char('d')));
-        assert!(!view.view.overview_description_expanded);
+
+        assert_eq!(view.view.overview_focus, OverviewFocus::Description);
+        state.handle_key(&mut view, key(KeyCode::Tab));
+        assert_eq!(view.view.overview_focus, OverviewFocus::LastActivity);
+        state.handle_key(&mut view, key(KeyCode::Tab));
+        assert_eq!(view.view.overview_focus, OverviewFocus::Description);
+
+        // Problems present: it joins the cycle before Description.
+        state.render_cache.overview_problems = vec![ratatui::text::Line::from("✕ ci")];
+        state.handle_key(&mut view, key(KeyCode::BackTab));
+        assert_eq!(view.view.overview_focus, OverviewFocus::Problems);
     }
 
     #[test]

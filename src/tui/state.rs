@@ -1,37 +1,63 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 
 use crate::api::{PrListResponse, PrSummary};
 use crate::github::types::{PrGroup, Priority};
 use crate::tui::app::AppState;
+use crate::tui::render::cache::ActivityEvent;
 use crate::tui::render::layout::{Blade, ViewLayout};
 
-/// Focusable section inside the Overview blade.
+/// Focusable section inside the Overview blade. Summary and Problems only
+/// exist when they have content (see `overview_section_layout`), so focus
+/// cycling walks the *visible* section list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverviewFocus {
-    #[default]
     Summary,
+    #[default]
     Description,
-    Checks,
+    Problems,
     LastActivity,
 }
 
 impl OverviewFocus {
-    pub fn next(self) -> Self {
-        match self {
-            OverviewFocus::Summary => OverviewFocus::Description,
-            OverviewFocus::Description => OverviewFocus::Checks,
-            OverviewFocus::Checks => OverviewFocus::LastActivity,
-            OverviewFocus::LastActivity => OverviewFocus::Summary,
+    /// The visible sections, top to bottom, for the given section presence.
+    fn visible_order(has_summary: bool, has_problems: bool) -> Vec<OverviewFocus> {
+        let mut order = Vec::with_capacity(4);
+        if has_summary {
+            order.push(OverviewFocus::Summary);
         }
+        if has_problems {
+            order.push(OverviewFocus::Problems);
+        }
+        order.push(OverviewFocus::Description);
+        order.push(OverviewFocus::LastActivity);
+        order
     }
 
-    pub fn prev(self) -> Self {
-        match self {
-            OverviewFocus::Summary => OverviewFocus::LastActivity,
-            OverviewFocus::Description => OverviewFocus::Summary,
-            OverviewFocus::Checks => OverviewFocus::Description,
-            OverviewFocus::LastActivity => OverviewFocus::Checks,
-        }
+    fn cycle(self, has_summary: bool, has_problems: bool, step: isize) -> Self {
+        let order = Self::visible_order(has_summary, has_problems);
+        let idx = order
+            .iter()
+            .position(|f| *f == self)
+            // A focus pointing at an absent section restarts from Description.
+            .unwrap_or_else(|| {
+                order
+                    .iter()
+                    .position(|f| *f == OverviewFocus::Description)
+                    .expect("Description is always visible")
+            });
+        let len = order.len() as isize;
+        order[((idx as isize + step).rem_euclid(len)) as usize]
+    }
+
+    pub fn next(self, has_summary: bool, has_problems: bool) -> Self {
+        self.cycle(has_summary, has_problems, 1)
+    }
+
+    pub fn prev(self, has_summary: bool, has_problems: bool) -> Self {
+        self.cycle(has_summary, has_problems, -1)
     }
 }
 
@@ -187,9 +213,6 @@ pub struct ViewState {
     pub selected_row: usize,
     pub selected_file_index: usize,
     pub overview_focus: OverviewFocus,
-    /// Whether the Overview DESCRIPTION section is fully expanded (toggled by `d`).
-    /// Defaults to collapsed so the catch-up sections aren't pushed below the fold.
-    pub overview_description_expanded: bool,
     /// Per-section fold state. Sections absent from the map inherit
     /// `InboxSection::default_collapsed()`.
     pub collapsed_sections: HashMap<InboxSection, bool>,
@@ -199,7 +222,7 @@ pub struct ViewState {
     pub inbox_scroll: ScrollState,
     pub overview_summary_scroll: ScrollState,
     pub overview_description_scroll: ScrollState,
-    pub overview_checks_scroll: ScrollState,
+    pub overview_problems_scroll: ScrollState,
     pub overview_last_activity_scroll: ScrollState,
     pub activity_scroll: ScrollState,
     pub files_scroll: ScrollState,
@@ -208,6 +231,18 @@ pub struct ViewState {
     /// Rendered Inbox rows (section headers + PR rows), in display order.
     /// The single source of truth for Inbox grouping/order; see `InboxRow`.
     pub inbox_rows: Vec<InboxRow>,
+
+    /// Selected event index in `RenderCache::activity_events`.
+    pub activity_selected: usize,
+    /// Event indices currently expanded to their full body.
+    pub activity_expanded: HashSet<usize>,
+    /// Derived render artifact: the flattened Activity display lines for this
+    /// frame (headers with selection styling + collapsed/expanded bodies).
+    /// Rebuilt in `prepare` via `flatten_activity_events`; the renderer reads
+    /// these instead of the raw cache.
+    pub activity_display_lines: Vec<Line<'static>>,
+    /// For each event, its header's index into `activity_display_lines`.
+    pub activity_event_starts: Vec<usize>,
 }
 
 impl Default for ViewState {
@@ -222,8 +257,7 @@ impl ViewState {
             active_blade: Blade::Inbox,
             selected_row: 0,
             selected_file_index: 0,
-            overview_focus: OverviewFocus::Summary,
-            overview_description_expanded: false,
+            overview_focus: OverviewFocus::Description,
             collapsed_sections: HashMap::new(),
             // Sentinel that matches no row; the first `prepare` falls back to the
             // first PR row.
@@ -231,12 +265,16 @@ impl ViewState {
             inbox_scroll: ScrollState::new(),
             overview_summary_scroll: ScrollState::new(),
             overview_description_scroll: ScrollState::new(),
-            overview_checks_scroll: ScrollState::new(),
+            overview_problems_scroll: ScrollState::new(),
             overview_last_activity_scroll: ScrollState::new(),
             activity_scroll: ScrollState::new(),
             files_scroll: ScrollState::new(),
             diff_scroll: ScrollState::new(),
             inbox_rows: Vec::new(),
+            activity_selected: 0,
+            activity_expanded: HashSet::new(),
+            activity_display_lines: Vec::new(),
+            activity_event_starts: Vec::new(),
         }
     }
 
@@ -247,7 +285,7 @@ impl ViewState {
             Blade::Overview => match self.overview_focus {
                 OverviewFocus::Summary => &self.overview_summary_scroll,
                 OverviewFocus::Description => &self.overview_description_scroll,
-                OverviewFocus::Checks => &self.overview_checks_scroll,
+                OverviewFocus::Problems => &self.overview_problems_scroll,
                 OverviewFocus::LastActivity => &self.overview_last_activity_scroll,
             },
             Blade::Activity => &self.activity_scroll,
@@ -263,7 +301,7 @@ impl ViewState {
             Blade::Overview => match self.overview_focus {
                 OverviewFocus::Summary => &mut self.overview_summary_scroll,
                 OverviewFocus::Description => &mut self.overview_description_scroll,
-                OverviewFocus::Checks => &mut self.overview_checks_scroll,
+                OverviewFocus::Problems => &mut self.overview_problems_scroll,
                 OverviewFocus::LastActivity => &mut self.overview_last_activity_scroll,
             },
             Blade::Activity => &mut self.activity_scroll,
@@ -276,11 +314,13 @@ impl ViewState {
         self.inbox_scroll.offset = 0;
         self.overview_summary_scroll.offset = 0;
         self.overview_description_scroll.offset = 0;
-        self.overview_checks_scroll.offset = 0;
+        self.overview_problems_scroll.offset = 0;
         self.overview_last_activity_scroll.offset = 0;
         self.activity_scroll.offset = 0;
         self.files_scroll.offset = 0;
         self.diff_scroll.offset = 0;
+        self.activity_selected = 0;
+        self.activity_expanded.clear();
     }
 }
 
@@ -381,9 +421,14 @@ impl ViewStateManager {
         );
 
         // 5. Clamp scroll offsets using the rebuilt cache lengths and current viewports.
-        // The Inbox blade reserves one row for its non-scrolling column header,
-        // so the scrollable viewport is one row shorter than the active content area.
-        let inbox_viewport = layout.blade(Blade::Inbox).content.height.saturating_sub(1) as usize;
+        // The Inbox blade reserves one row for its non-scrolling column header
+        // plus (when tall enough) the selected-PR preview strip at the bottom;
+        // `inbox_preview_rows` is shared with `render_inbox` so clamping
+        // matches rendering.
+        let inbox_body = layout.blade(Blade::Inbox).content.height.saturating_sub(1);
+        let inbox_viewport = inbox_body
+            .saturating_sub(crate::tui::views::inbox::inbox_preview_rows(inbox_body))
+            as usize;
         self.view
             .inbox_scroll
             .set_content_viewport(self.view.inbox_rows.len(), inbox_viewport);
@@ -396,10 +441,37 @@ impl ViewStateManager {
             .files_scroll
             .set_content_viewport(file_count, files_viewport);
 
+        // Activity: clamp selection/expansion to the rebuilt event list
+        // *before* flattening (a stale index must never style no row or
+        // panic-index the starts), then flatten to display lines — the
+        // renderer reads `activity_display_lines`, not the raw cache.
+        let event_count = app.render_cache.activity_events.len();
+        if event_count == 0 {
+            self.view.activity_selected = 0;
+            self.view.activity_expanded.clear();
+        } else {
+            self.view.activity_selected = self.view.activity_selected.min(event_count - 1);
+            self.view.activity_expanded.retain(|i| *i < event_count);
+        }
+        let (display_lines, event_starts) = flatten_activity_events(
+            &app.render_cache.activity_events,
+            &self.view.activity_expanded,
+            self.view.activity_selected,
+            layout.blade(Blade::Activity).content.width,
+        );
+        self.view.activity_display_lines = display_lines;
+        self.view.activity_event_starts = event_starts;
         self.view.activity_scroll.set_content_viewport(
-            app.render_cache.activity_lines.len(),
+            self.view.activity_display_lines.len(),
             layout.blade(Blade::Activity).content.height as usize,
         );
+        if let Some(&start) = self
+            .view
+            .activity_event_starts
+            .get(self.view.activity_selected)
+        {
+            self.view.activity_scroll.keep_visible(start);
+        }
 
         // The Diff blade reserves one row for its stats header, so the scrollable
         // viewport is one row shorter than the active content area.
@@ -408,44 +480,50 @@ impl ViewStateManager {
             .diff_scroll
             .set_content_viewport(app.render_cache.diff_lines.len(), diff_viewport);
 
-        // Clamp each Overview section against the height it is actually rendered
-        // into, not the full body. `render_body_rows` splits the body via
-        // `overview_section_heights`; mirror that here so scrolling can reach
-        // content that overflows a section's slice.
-        let lens = [
+        // Normalize the Overview focus: if a data refresh removed the section
+        // it pointed at (e.g. checks went green), fall back to Description.
+        let summary_len = crate::tui::views::overview::effective_summary_len(
             app.render_cache.overview_summary.len(),
-            // Collapse-aware: match the Description rows `render_body_rows`
-            // actually shows, so scroll clamping doesn't reserve height for
-            // lines hidden behind the "d to expand" marker.
-            crate::tui::views::overview::description_display_line_count(
-                app.render_cache.overview_description.len(),
-                self.view.overview_description_expanded,
-            ),
-            app.render_cache.overview_checks.len(),
-        ];
+            crate::tui::views::overview::summary_loading(app),
+        );
+        let problems_len = app.render_cache.overview_problems.len();
+        let has_summary = summary_len > 0;
+        let has_problems = problems_len > 0;
+        if (self.view.overview_focus == OverviewFocus::Summary && !has_summary)
+            || (self.view.overview_focus == OverviewFocus::Problems && !has_problems)
+        {
+            self.view.overview_focus = OverviewFocus::Description;
+        }
+
+        // Clamp each Overview section against the height it is actually
+        // rendered into. `overview_section_layout` is shared with
+        // `render_body_rows` so scroll clamping matches the rendered viewport.
         let overview_body = layout
             .blade(Blade::Overview)
             .content
             .height
             .saturating_sub(crate::tui::views::overview::OVERVIEW_CHROME_ROWS);
-        let section_heights = crate::tui::views::overview::overview_section_heights(
+        let sections = crate::tui::views::overview::overview_section_layout(
             overview_body,
-            lens,
-            self.view.overview_focus,
+            summary_len,
+            problems_len,
         );
         // Each scrollable section reserves one row for its header label.
-        self.view
-            .overview_summary_scroll
-            .set_content_viewport(lens[0], section_heights[0].saturating_sub(1) as usize);
-        self.view
-            .overview_description_scroll
-            .set_content_viewport(lens[1], section_heights[1].saturating_sub(1) as usize);
-        self.view
-            .overview_checks_scroll
-            .set_content_viewport(lens[2], section_heights[2].saturating_sub(1) as usize);
+        self.view.overview_summary_scroll.set_content_viewport(
+            app.render_cache.overview_summary.len(),
+            sections.summary.unwrap_or(0).saturating_sub(1) as usize,
+        );
+        self.view.overview_description_scroll.set_content_viewport(
+            app.render_cache.overview_description.len(),
+            sections.description.saturating_sub(1) as usize,
+        );
+        self.view.overview_problems_scroll.set_content_viewport(
+            problems_len,
+            sections.problems.unwrap_or(0).saturating_sub(1) as usize,
+        );
         self.view
             .overview_last_activity_scroll
-            .set_content_viewport(1, section_heights[3] as usize);
+            .set_content_viewport(1, sections.last_activity as usize);
 
         // 6. Keep selected items visible. `selected_row` already indexes the
         // rendered line space (`inbox_rows` includes header rows).
@@ -458,6 +536,93 @@ impl ViewStateManager {
                 .keep_visible(self.view.selected_file_index.min(file_count - 1));
         }
     }
+}
+
+/// How many body lines a collapsed event shows before the expand marker.
+const ACTIVITY_COLLAPSED_BODY_LINES: usize = 4;
+
+/// Flatten the cached activity events into display lines, applying selection
+/// styling and collapse state. Returns the lines plus, for each event, the
+/// index of its header line (so selection can be kept visible).
+///
+/// Collapsed events show their first [`ACTIVITY_COLLAPSED_BODY_LINES`] body
+/// lines plus a `… (+N more lines) — ⏎ expand` marker; expanded events show
+/// everything. Body lines are cloned from the cache — markdown is *not*
+/// re-parsed here.
+pub fn flatten_activity_events(
+    events: &[ActivityEvent],
+    expanded: &HashSet<usize>,
+    selected: usize,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    use crate::tui::render::theme::MUTED;
+
+    let mut lines = Vec::new();
+    let mut starts = Vec::with_capacity(events.len());
+    for (idx, event) in events.iter().enumerate() {
+        starts.push(lines.len());
+        lines.push(activity_header_line(event, idx == selected, width));
+        if expanded.contains(&idx) {
+            lines.extend(event.body.iter().cloned());
+        } else {
+            lines.extend(
+                event
+                    .body
+                    .iter()
+                    .take(ACTIVITY_COLLAPSED_BODY_LINES)
+                    .cloned(),
+            );
+            let hidden = event
+                .body
+                .len()
+                .saturating_sub(ACTIVITY_COLLAPSED_BODY_LINES);
+            if hidden > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "   … (+{hidden} more line{}) — ⏎ expand",
+                        if hidden == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(MUTED),
+                )));
+            }
+        }
+    }
+    (lines, starts)
+}
+
+/// Build an event's header display line. The selected event gets the `▌` bar
+/// prefix and a `SURFACE0` background across every span, padded to full width
+/// (the same selection grammar as inbox rows); unselected headers get a blank
+/// bar slot and the cached base styling untouched.
+fn activity_header_line(event: &ActivityEvent, selected: bool, width: u16) -> Line<'static> {
+    use crate::tui::render::theme::{ACTIVITY, SURFACE0};
+
+    if !selected {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(event.header_spans.len() + 1);
+        spans.push(Span::raw(" "));
+        spans.extend(event.header_spans.iter().cloned());
+        return Line::from(spans);
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(event.header_spans.len() + 2);
+    spans.push(Span::styled(
+        "▌",
+        Style::default().fg(ACTIVITY).bg(SURFACE0),
+    ));
+    for span in &event.header_spans {
+        spans.push(Span::styled(
+            span.content.clone().into_owned(),
+            span.style.bg(SURFACE0),
+        ));
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if (used as u16) < width {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(SURFACE0),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn priority_rank(p: Option<&Priority>) -> u8 {
@@ -613,6 +778,8 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             url: "https://example.com".to_string(),
             comments: 0,
+            head_ref: String::new(),
+            llm_one_line: None,
         }
     }
 
@@ -667,6 +834,8 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             url: "https://example.com".to_string(),
             comments: 0,
+            head_ref: String::new(),
+            llm_one_line: None,
         }
     }
 
@@ -1218,18 +1387,264 @@ mod tests {
     }
 
     #[test]
-    fn overview_focus_cycles() {
-        let mut focus = OverviewFocus::Summary;
-        focus = focus.next();
-        assert_eq!(focus, OverviewFocus::Description);
-        focus = focus.next();
-        assert_eq!(focus, OverviewFocus::Checks);
-        focus = focus.next();
-        assert_eq!(focus, OverviewFocus::LastActivity);
-        focus = focus.next();
-        assert_eq!(focus, OverviewFocus::Summary);
+    fn prepare_inbox_viewport_accounts_for_preview_strip() {
+        // 40 PRs — far more than any viewport.
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            (0..40)
+                .map(|i| {
+                    make_summary(
+                        &format!("org~repo~{}", i),
+                        PrGroup::ReviewNeeded,
+                        "other",
+                        None,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut state = make_test_state(groups);
+        let mut mgr = ViewStateManager::new();
+        mgr.view.active_blade = Blade::Inbox;
+        let layout = make_layout(120, 30, Blade::Inbox);
 
-        focus = focus.prev();
+        mgr.prepare(&mut state, &layout);
+
+        let content_height = layout.blade(Blade::Inbox).content.height;
+        let body = content_height - 1; // column header
+        let strip = crate::tui::views::inbox::inbox_preview_rows(body);
+        assert_eq!(strip, 2, "tall body shows the preview strip");
+        assert_eq!(
+            mgr.view.inbox_scroll.viewport_height,
+            (body - strip) as usize,
+            "scroll viewport excludes header and preview strip"
+        );
+
+        // Scrolling to the last row must be reachable: max_scroll positions
+        // the final row at the bottom of the reduced viewport.
+        let rows = mgr.view.inbox_rows.len();
+        assert_eq!(
+            mgr.view.inbox_scroll.max_scroll(),
+            rows - mgr.view.inbox_scroll.viewport_height
+        );
+    }
+
+    fn make_event(actor: &str, body_lines: usize) -> ActivityEvent {
+        ActivityEvent {
+            header_spans: vec![Span::styled(
+                format!("@{} commented", actor),
+                Style::default(),
+            )],
+            body: (0..body_lines)
+                .map(|i| Line::from(format!("body {i}")))
+                .collect(),
+            raw_body: "raw".to_string(),
+            url: String::new(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            actor: actor.to_string(),
+        }
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn flatten_collapsed_preview_and_marker() {
+        let events = vec![make_event("a", 10)];
+        let (lines, starts) = flatten_activity_events(&events, &HashSet::new(), 0, 80);
+        assert_eq!(starts, vec![0]);
+        // Header + 4 preview lines + marker.
+        assert_eq!(lines.len(), 1 + ACTIVITY_COLLAPSED_BODY_LINES + 1);
+        let marker = line_text(lines.last().unwrap());
+        assert!(marker.contains("+6 more lines"), "marker: {marker}");
+        assert!(marker.contains("⏎ expand"));
+
+        // Short bodies get no marker.
+        let events = vec![make_event("a", 3)];
+        let (lines, _) = flatten_activity_events(&events, &HashSet::new(), 0, 80);
+        assert_eq!(lines.len(), 1 + 3);
+        assert!(!lines.iter().any(|l| line_text(l).contains("more line")));
+    }
+
+    #[test]
+    fn flatten_expanded_full_body() {
+        let events = vec![make_event("a", 10)];
+        let mut expanded = HashSet::new();
+        expanded.insert(0usize);
+        let (lines, _) = flatten_activity_events(&events, &expanded, 0, 80);
+        assert_eq!(lines.len(), 1 + 10, "full body, no marker");
+        assert!(!lines.iter().any(|l| line_text(l).contains("more line")));
+        assert!(line_text(&lines[10]).contains("body 9"));
+    }
+
+    #[test]
+    fn flatten_selected_header_gets_bar_and_bg() {
+        use crate::tui::render::theme::SURFACE0;
+        let events = vec![make_event("a", 0), make_event("b", 0)];
+        let (lines, starts) = flatten_activity_events(&events, &HashSet::new(), 1, 40);
+
+        // Unselected header keeps a blank bar slot, no selection bg.
+        let unselected = &lines[starts[0]];
+        assert_eq!(unselected.spans[0].content, " ");
+        assert!(unselected.spans.iter().all(|s| s.style.bg.is_none()));
+
+        // Selected header: bar prefix, SURFACE0 bg on every span, padded to
+        // the full width (same selection grammar as inbox rows).
+        let selected = &lines[starts[1]];
+        assert_eq!(selected.spans[0].content, "▌");
+        assert!(selected.spans.iter().all(|s| s.style.bg == Some(SURFACE0)));
+        let drawn: usize = selected
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert_eq!(drawn, 40, "selected header painted full-width");
+    }
+
+    fn detail_with_timeline(id: &str, n: usize) -> crate::api::PrDetailResponse {
+        crate::api::PrDetailResponse {
+            id: id.to_string(),
+            node_id: "node".to_string(),
+            owner: "org".to_string(),
+            repo: "repo".to_string(),
+            number: 1,
+            title: "Test PR".to_string(),
+            body: String::new(),
+            url: "https://example.com".to_string(),
+            author: "other".to_string(),
+            is_draft: false,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            mergeable: crate::github::types::MergeableState::Mergeable,
+            review_decision: None,
+            review_requests: vec![],
+            team_review_requests: vec![],
+            viewer_latest_review: None,
+            latest_reviews: vec![],
+            check_status: crate::github::types::CheckStatus::None,
+            checks: vec![],
+            review_threads: vec![],
+            files: vec![],
+            timeline: (0..n)
+                .map(|i| crate::api::TimelineEventDto {
+                    event_type: crate::github::types::TimelineEventType::Comment,
+                    actor: format!("user{i}"),
+                    created_at: format!("2024-01-01T00:00:{:02}Z", i % 60),
+                    detail: String::new(),
+                    url: String::new(),
+                })
+                .collect(),
+            llm_priority: None,
+            llm_summary: None,
+            llm_rich_summary: None,
+            last_seen_at: None,
+        }
+    }
+
+    #[test]
+    fn activity_selection_keeps_header_visible() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
+        );
+        let mut state = make_test_state(groups);
+        state.selected_pr_id = Some("org~repo~1".to_string());
+        let mut mgr = ViewStateManager::new();
+        mgr.view.active_blade = Blade::Activity;
+        let layout = make_layout(120, 30, Blade::Activity);
+
+        // Settle the initial selection, then load a detail with far more
+        // events than the viewport holds.
+        mgr.prepare(&mut state, &layout);
+        state.detail_needs_reload = false;
+        state.diff_needs_reload = false;
+        state.pr_detail = Some(detail_with_timeline("org~repo~1", 40));
+
+        mgr.view.activity_selected = 39;
+        mgr.prepare(&mut state, &layout);
+
+        assert_eq!(mgr.view.activity_event_starts.len(), 40);
+        let start = mgr.view.activity_event_starts[39];
+        let scroll = &mgr.view.activity_scroll;
+        assert!(scroll.viewport_height > 0);
+        assert!(
+            start >= scroll.offset && start < scroll.offset + scroll.viewport_height,
+            "selected header (line {start}) must be inside the viewport \
+             [{}, {})",
+            scroll.offset,
+            scroll.offset + scroll.viewport_height
+        );
+
+        // A stale selection index is clamped before flattening.
+        mgr.view.activity_selected = 500;
+        mgr.view.activity_expanded.insert(500);
+        mgr.prepare(&mut state, &layout);
+        assert_eq!(mgr.view.activity_selected, 39);
+        assert!(mgr.view.activity_expanded.is_empty());
+    }
+
+    #[test]
+    fn overview_focus_cycles_over_visible_sections() {
+        // Everything visible: Summary → Problems → Description → LastActivity.
+        let mut focus = OverviewFocus::Summary;
+        focus = focus.next(true, true);
+        assert_eq!(focus, OverviewFocus::Problems);
+        focus = focus.next(true, true);
+        assert_eq!(focus, OverviewFocus::Description);
+        focus = focus.next(true, true);
         assert_eq!(focus, OverviewFocus::LastActivity);
+        focus = focus.next(true, true);
+        assert_eq!(focus, OverviewFocus::Summary);
+        focus = focus.prev(true, true);
+        assert_eq!(focus, OverviewFocus::LastActivity);
+
+        // Absent sections are skipped entirely.
+        let mut focus = OverviewFocus::Description;
+        focus = focus.next(false, false);
+        assert_eq!(focus, OverviewFocus::LastActivity);
+        focus = focus.next(false, false);
+        assert_eq!(focus, OverviewFocus::Description);
+
+        // A stale focus on an absent section restarts from Description.
+        let focus = OverviewFocus::Problems.next(true, false);
+        assert_eq!(focus, OverviewFocus::LastActivity);
+    }
+
+    #[test]
+    fn overview_focus_normalizes_when_section_disappears() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            PrGroup::ReviewNeeded,
+            vec![make_summary(
+                "org~repo~1",
+                PrGroup::ReviewNeeded,
+                "other",
+                None,
+            )],
+        );
+        let mut state = make_test_state(groups);
+        let mut mgr = ViewStateManager::new();
+        mgr.view.active_blade = Blade::Overview;
+        // The user had the (formerly present) Problems section focused, then a
+        // refresh turned the checks green: the rebuilt cache has no problems.
+        mgr.view.overview_focus = OverviewFocus::Problems;
+        let layout = make_layout(120, 30, Blade::Overview);
+
+        mgr.prepare(&mut state, &layout);
+
+        assert!(state.render_cache.overview_problems.is_empty());
+        assert_eq!(
+            mgr.view.overview_focus,
+            OverviewFocus::Description,
+            "focus on an absent section resets to Description"
+        );
     }
 }

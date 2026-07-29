@@ -159,7 +159,10 @@ fn render_status_stats_row(f: &mut Frame, area: Rect, detail: Option<&PrDetailRe
     );
 }
 
-fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
+/// Review/merge/CI status chip labels with their colors. Shared by the
+/// Overview status row and the command line (`render_command_line`); each
+/// call site applies its own background.
+pub fn status_chip_data(d: &PrDetailResponse) -> Vec<(String, Color)> {
     let mut chips: Vec<(String, Color)> = Vec::new();
 
     let (review_text, review_color) = match d.review_decision {
@@ -185,8 +188,12 @@ fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
     };
     chips.push((checks_text.to_string(), checks_color));
 
+    chips
+}
+
+fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (i, (text, color)) in chips.into_iter().enumerate() {
+    for (i, (text, color)) in status_chip_data(d).into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("  ", Style::default().bg(SURFACE0)));
         }
@@ -203,7 +210,7 @@ fn status_chips(d: &PrDetailResponse) -> Vec<Span<'static>> {
 
 /// Compact diff/comment counts appended after the status chips. This data is
 /// otherwise duplicated in full elsewhere (file count in the Files blade,
-/// comment count in the Inbox's ✎ column), so it's kept terse here rather
+/// per-event detail in the Activity blade), so it's kept terse here rather
 /// than given its own labeled row.
 fn diff_stat_spans(d: &PrDetailResponse) -> Vec<Span<'static>> {
     let added: u64 = d.files.iter().map(|f| f.additions).sum();
@@ -236,46 +243,90 @@ fn diff_stat_spans(d: &PrDetailResponse) -> Vec<Span<'static>> {
     ]
 }
 
-/// Number of Description content lines shown when collapsed (the default).
-/// The rest of the description is hidden behind the `d to expand` marker so a
-/// long markdown body doesn't push Checks/Last Activity off screen.
-const COLLAPSED_DESCRIPTION_LINES: usize = 4;
+/// Whether the Brunson-summary section is in its "loading" state: a rich
+/// LLM summary fetch is in flight and the loaded detail doesn't have one yet.
+/// Shared by `render_body_rows` and `ViewStateManager::prepare`.
+pub fn summary_loading(state: &crate::tui::app::AppState) -> bool {
+    state.llm_detail_loading
+        && state
+            .pr_detail
+            .as_ref()
+            .is_some_and(|d| d.llm_rich_summary.is_none())
+}
 
-/// Number of lines [`description_display_lines`] would render for a description
-/// of `total` lines. Shared with `ViewStateManager::prepare` so the Description
-/// scroll clamp matches the rows actually shown (a collapsed preview claims only
-/// the preview lines plus the expand marker, not the full body).
-pub fn description_display_line_count(total: usize, expanded: bool) -> usize {
-    if expanded || total <= COLLAPSED_DESCRIPTION_LINES {
-        total
+/// Effective summary line count fed into [`overview_section_layout`]: while
+/// the LLM sparkle is loading, an empty summary still claims one placeholder
+/// row (the "Brunson is thinking..." line), so the section stays visible.
+pub fn effective_summary_len(lines: usize, loading: bool) -> usize {
+    if loading {
+        lines.max(1)
     } else {
-        COLLAPSED_DESCRIPTION_LINES + 1
+        lines
     }
 }
 
-/// Build the lines actually shown for the Description section: a short
-/// preview plus an expand hint when collapsed, or everything when expanded
-/// (or when the description is already short enough that collapsing it
-/// wouldn't hide anything).
-fn description_display_lines(lines: &[Line<'static>], expanded: bool) -> Vec<Line<'static>> {
-    if expanded || lines.len() <= COLLAPSED_DESCRIPTION_LINES {
-        return lines.to_vec();
-    }
-    let mut preview = lines[..COLLAPSED_DESCRIPTION_LINES].to_vec();
-    let more = lines.len() - COLLAPSED_DESCRIPTION_LINES;
-    preview.push(Line::from(Span::styled(
-        format!(
-            "… d to expand ({more} more line{})",
-            if more == 1 { "" } else { "s" }
-        ),
-        Style::default().fg(MUTED),
-    )));
-    preview
+/// Resolved Overview body layout. `None` means the section is absent this
+/// frame (no content), not merely zero-height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverviewSectionLayout {
+    /// `Brunson Says...` — absent when there is no summary and none loading.
+    pub summary: Option<u16>,
+    /// `PROBLEMS` — absent when nothing is wrong.
+    pub problems: Option<u16>,
+    /// `DESCRIPTION` — always present; absorbs all remaining rows.
+    pub description: u16,
+    /// `LAST ACTIVITY` — 1 when it fits, else 0.
+    pub last_activity: u16,
 }
 
-/// Render the Overview body as stacked sections: Summary, Description, Checks,
-/// Last Activity. Heights are computed by [`overview_section_heights`], which is
-/// also used by `prepare` so scroll clamping matches the rendered viewport.
+/// Compute the Overview body layout (each present section's height includes
+/// its 1-row header). Deterministic and focus-independent: the description
+/// always absorbs the remainder, so `OverviewFocus` only decides which
+/// section's scroll offset `j`/`k` drives. Present-section heights plus
+/// `description` plus `last_activity` always sum exactly to `body_height`.
+///
+/// Shared by `render_body_rows` and `ViewStateManager::prepare` so scroll
+/// clamping matches the rendered viewport.
+pub fn overview_section_layout(
+    body_height: u16,
+    summary_len: usize,
+    problems_len: usize,
+) -> OverviewSectionLayout {
+    let mut remaining = body_height;
+
+    // Last Activity: a single reserved row.
+    let last_activity = remaining.min(1);
+    remaining -= last_activity;
+
+    // Summary: capped at min(content + header, 40% of the body); scrollable
+    // when capped.
+    let summary = (summary_len > 0).then(|| {
+        let cap = ((body_height as u32) * 40 / 100) as u16;
+        let want = (summary_len.min(u16::MAX as usize - 1) as u16).saturating_add(1);
+        want.min(cap).min(remaining)
+    });
+    remaining -= summary.unwrap_or(0);
+
+    // Problems: capped at min(content + header, 6 rows); scrollable.
+    let problems = (problems_len > 0).then(|| {
+        let want = (problems_len.min(u16::MAX as usize - 1) as u16).saturating_add(1);
+        want.min(6).min(remaining)
+    });
+    remaining -= problems.unwrap_or(0);
+
+    // Description owns everything left.
+    OverviewSectionLayout {
+        summary,
+        problems,
+        description: remaining,
+        last_activity,
+    }
+}
+
+/// Render the Overview body as stacked sections: Summary (when present),
+/// Problems (when present), Description, Last Activity. Heights come from
+/// [`overview_section_layout`], which is also used by `prepare` so scroll
+/// clamping matches the rendered viewport.
 fn render_body_rows(
     f: &mut Frame,
     area: Rect,
@@ -291,157 +342,54 @@ fn render_body_rows(
     };
 
     let cache = &ctx.state.render_cache;
-    let description_expanded = view.overview_description_expanded;
-    let description_lines =
-        description_display_lines(&cache.overview_description, description_expanded);
-    // Feed the *displayed* line count (not the full description length) into
-    // the height split, so a collapsed description only claims the couple of
-    // rows it actually renders instead of ballooning to fit hidden content.
-    let lens = [
-        cache.overview_summary.len(),
-        description_lines.len(),
-        cache.overview_checks.len(),
-    ];
-    let heights = overview_section_heights(area.height, lens, view.overview_focus);
+    let loading_summary = summary_loading(ctx.state);
+    let summary_len = effective_summary_len(cache.overview_summary.len(), loading_summary);
+    let sections = overview_section_layout(area.height, summary_len, cache.overview_problems.len());
 
     // Lay sections out top-to-bottom using the shared heights.
     let mut y = area.y;
     let rect_for = |y: u16, h: u16| Rect::new(area.x, y, area.width, h);
 
-    let loading_summary = ctx.state.llm_detail_loading
-        && ctx
-            .state
-            .pr_detail
-            .as_ref()
-            .and_then(|d| d.llm_rich_summary.as_ref())
-            .is_none();
+    if let Some(h) = sections.summary {
+        render_section(
+            f,
+            rect_for(y, h),
+            "Brunson Says...",
+            &cache.overview_summary,
+            view.overview_summary_scroll.offset,
+            view.overview_focus == OverviewFocus::Summary,
+            loading_summary,
+        );
+        y = y.saturating_add(h);
+    }
+    if let Some(h) = sections.problems {
+        render_section(
+            f,
+            rect_for(y, h),
+            "PROBLEMS",
+            &cache.overview_problems,
+            view.overview_problems_scroll.offset,
+            view.overview_focus == OverviewFocus::Problems,
+            false,
+        );
+        y = y.saturating_add(h);
+    }
     render_section(
         f,
-        rect_for(y, heights[0]),
-        "Brunson Says...",
-        &cache.overview_summary,
-        view.overview_summary_scroll.offset,
-        view.overview_focus == OverviewFocus::Summary,
-        loading_summary,
-    );
-    y = y.saturating_add(heights[0]);
-    render_section(
-        f,
-        rect_for(y, heights[1]),
+        rect_for(y, sections.description),
         "DESCRIPTION",
-        &description_lines,
-        // Scrolling a preview doesn't make sense; only honor the scroll
-        // offset once the full description is showing.
-        if description_expanded {
-            view.overview_description_scroll.offset
-        } else {
-            0
-        },
+        &cache.overview_description,
+        view.overview_description_scroll.offset,
         view.overview_focus == OverviewFocus::Description,
         false,
     );
-    y = y.saturating_add(heights[1]);
-    render_section(
-        f,
-        rect_for(y, heights[2]),
-        "CHECKS",
-        &cache.overview_checks,
-        view.overview_checks_scroll.offset,
-        view.overview_focus == OverviewFocus::Checks,
-        false,
-    );
-    y = y.saturating_add(heights[2]);
+    y = y.saturating_add(sections.description);
     render_last_activity(
         f,
-        rect_for(y, heights[3]),
+        rect_for(y, sections.last_activity),
         d,
         view.overview_focus == OverviewFocus::LastActivity,
     );
-}
-
-/// Compute per-section heights (including each section's header row) for the
-/// Overview body. The three scrollable sections (summary, description, checks)
-/// grow to show their content; the focused section absorbs any leftover rows so
-/// scrolling feels natural. Last Activity is always a single line.
-///
-/// The returned heights always sum to `body_height` (when it is at least 1), so
-/// callers can lay sections out contiguously with no gaps or overflow.
-pub fn overview_section_heights(
-    body_height: u16,
-    lens: [usize; 3],
-    focus: OverviewFocus,
-) -> [u16; 4] {
-    if body_height == 0 {
-        return [0, 0, 0, 0];
-    }
-
-    // Reserve one line for Last Activity.
-    let last = 1u16.min(body_height);
-    let mut remaining = body_height - last;
-    let mut heights = [0u16, 0, 0];
-
-    // 1. A header row for each scrollable section we can fit.
-    for h in heights.iter_mut() {
-        if remaining == 0 {
-            break;
-        }
-        *h += 1;
-        remaining -= 1;
-    }
-    // 2. A first body row each, so even a focused-but-short section shows content.
-    for h in heights.iter_mut() {
-        if remaining == 0 {
-            break;
-        }
-        if *h >= 1 {
-            *h += 1;
-            remaining -= 1;
-        }
-    }
-
-    let focus_idx = match focus {
-        OverviewFocus::Summary => Some(0usize),
-        OverviewFocus::Description => Some(1),
-        OverviewFocus::Checks => Some(2),
-        OverviewFocus::LastActivity => None,
-    };
-
-    // 3. Distribute remaining rows by content need, focused section first.
-    let mut order: Vec<usize> = Vec::new();
-    if let Some(fi) = focus_idx {
-        order.push(fi);
-    }
-    for i in 0..3 {
-        if Some(i) != focus_idx {
-            order.push(i);
-        }
-    }
-    for &i in &order {
-        if remaining == 0 {
-            break;
-        }
-        if heights[i] == 0 {
-            continue;
-        }
-        // Rows still wanted to show all content: 1 header + lens[i] body lines.
-        let want = 1u16.saturating_add(lens[i].min(u16::MAX as usize) as u16);
-        let grant = remaining.min(want.saturating_sub(heights[i]));
-        heights[i] += grant;
-        remaining -= grant;
-    }
-
-    // 4. Any slack goes to the focused scrollable section (or description as a
-    //    default when Last Activity is focused), so no rows are wasted as gaps.
-    if remaining > 0 {
-        let sink = focus_idx.unwrap_or(1);
-        if heights[sink] > 0 {
-            heights[sink] += remaining;
-        } else if let Some(i) = heights.iter().position(|h| *h > 0) {
-            heights[i] += remaining;
-        }
-    }
-
-    [heights[0], heights[1], heights[2], last]
 }
 
 fn render_section(
@@ -544,77 +492,69 @@ fn render_last_activity(f: &mut Frame, area: Rect, detail: &PrDetailResponse, fo
 mod tests {
     use super::*;
 
+    fn layout_sum(l: &OverviewSectionLayout) -> u16 {
+        l.summary.unwrap_or(0) + l.problems.unwrap_or(0) + l.description + l.last_activity
+    }
+
     #[test]
-    fn section_heights_sum_to_body_height() {
+    fn section_layout_sums_to_body_height() {
         for height in 0..=40u16 {
-            let h = overview_section_heights(height, [3, 50, 5], OverviewFocus::Description);
-            assert_eq!(h.iter().sum::<u16>(), height, "height={height}");
+            for (summary, problems) in [(0, 0), (3, 0), (0, 5), (3, 5), (100, 100)] {
+                let l = overview_section_layout(height, summary, problems);
+                assert_eq!(
+                    layout_sum(&l),
+                    height,
+                    "height={height} summary={summary} problems={problems}"
+                );
+            }
         }
     }
 
     #[test]
-    fn focused_section_absorbs_slack_when_all_content_is_short() {
-        // Plenty of room, tiny content: the focused section should grow.
-        let h = overview_section_heights(30, [1, 1, 1], OverviewFocus::Summary);
-        assert_eq!(h.iter().sum::<u16>(), 30);
-        assert!(
-            h[0] > h[1] && h[0] > h[2],
-            "focused summary should be tallest: {h:?}"
-        );
+    fn section_layout_description_absorbs_remainder() {
+        let l = overview_section_layout(30, 3, 2);
+        assert_eq!(l.summary, Some(4), "summary = content + header");
+        assert_eq!(l.problems, Some(3), "problems = content + header");
+        assert_eq!(l.last_activity, 1);
+        assert_eq!(l.description, 30 - 4 - 3 - 1);
+
+        // With no summary/problems, the description owns everything but the
+        // Last Activity row.
+        let l = overview_section_layout(30, 0, 0);
+        assert_eq!(l.summary, None);
+        assert_eq!(l.problems, None);
+        assert_eq!(l.description, 29);
     }
 
     #[test]
-    fn long_section_grows_even_when_unfocused() {
-        // Description has lots of content; it should claim most of the space
-        // even though Summary is focused, because Summary doesn't need it.
-        let h = overview_section_heights(30, [1, 50, 1], OverviewFocus::Summary);
-        assert_eq!(h.iter().sum::<u16>(), 30);
-        assert!(
-            h[1] > h[0],
-            "long description should outgrow summary: {h:?}"
-        );
+    fn section_layout_caps_summary_and_problems() {
+        let l = overview_section_layout(30, 100, 100);
+        // Summary caps at 40% of the body.
+        assert_eq!(l.summary, Some(12));
+        // Problems caps at 6 rows.
+        assert_eq!(l.problems, Some(6));
+        assert!(l.description > 0, "description keeps the remainder");
     }
 
     #[test]
-    fn last_activity_is_single_line_when_room_exists() {
-        let h = overview_section_heights(20, [2, 2, 2], OverviewFocus::Summary);
-        assert_eq!(h[3], 1);
+    fn problems_section_absent_when_checks_green() {
+        let l = overview_section_layout(30, 3, 0);
+        assert_eq!(l.problems, None);
     }
 
     #[test]
-    fn degrades_without_overflow_on_tiny_bodies() {
+    fn section_layout_degrades_without_overflow_on_tiny_bodies() {
         for height in 0..=6u16 {
-            let h = overview_section_heights(height, [10, 10, 10], OverviewFocus::Checks);
-            assert_eq!(h.iter().sum::<u16>(), height, "height={height}");
+            let l = overview_section_layout(height, 10, 10);
+            assert_eq!(layout_sum(&l), height, "height={height}");
         }
     }
 
-    fn lines(n: usize) -> Vec<Line<'static>> {
-        (0..n).map(|i| Line::from(format!("line {i}"))).collect()
-    }
-
     #[test]
-    fn collapsed_description_shows_preview_plus_marker() {
-        let full = lines(40);
-        let shown = description_display_lines(&full, false);
-        assert_eq!(shown.len(), COLLAPSED_DESCRIPTION_LINES + 1);
-        assert_eq!(shown[0].spans[0].content, "line 0");
-        assert!(shown.last().unwrap().spans[0]
-            .content
-            .contains("36 more lines"));
-    }
-
-    #[test]
-    fn expanded_description_shows_everything() {
-        let full = lines(40);
-        let shown = description_display_lines(&full, true);
-        assert_eq!(shown.len(), 40);
-    }
-
-    #[test]
-    fn short_description_is_not_truncated_even_when_collapsed() {
-        let full = lines(COLLAPSED_DESCRIPTION_LINES);
-        let shown = description_display_lines(&full, false);
-        assert_eq!(shown.len(), COLLAPSED_DESCRIPTION_LINES);
+    fn effective_summary_len_reserves_a_row_while_loading() {
+        assert_eq!(effective_summary_len(0, true), 1);
+        assert_eq!(effective_summary_len(0, false), 0);
+        assert_eq!(effective_summary_len(5, true), 5);
+        assert_eq!(effective_summary_len(5, false), 5);
     }
 }

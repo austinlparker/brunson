@@ -96,7 +96,6 @@ fn help_lines() -> Vec<Line<'static>> {
     section(&mut lines, "Overview");
     for (k, a) in [
         ("tab / S-tab", "cycle section"),
-        ("d", "expand description"),
         ("j / k", "scroll section"),
     ] {
         lines.push(binding(k, a));
@@ -105,8 +104,11 @@ fn help_lines() -> Vec<Line<'static>> {
 
     section(&mut lines, "Activity");
     for (k, a) in [
-        ("j / k", "scroll"),
-        ("g / G", "top / bottom"),
+        ("j / k", "select event"),
+        ("⏎ / space", "expand / collapse event"),
+        ("y", "copy comment body"),
+        ("o", "open event in browser"),
+        ("g / G", "first / last event"),
         ("^d / ^u", "half-page"),
     ] {
         lines.push(binding(k, a));
@@ -154,4 +156,40 @@ fn binding(key: &str, action: &str) -> Line<'static> {
         ),
         Span::styled(action.to_string(), Style::default().fg(SUBTEXT0)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn help_text() -> String {
+        help_lines()
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_lists_activity_event_bindings() {
+        let text = help_text();
+        assert!(text.contains("expand / collapse event"));
+        assert!(text.contains("copy comment body"));
+        assert!(text.contains("open event in browser"));
+        assert!(text.contains("select event"));
+    }
+
+    #[test]
+    fn help_no_longer_lists_description_expand() {
+        let text = help_text();
+        assert!(
+            !text.contains("expand description"),
+            "the `d` Overview binding was removed"
+        );
+    }
 }

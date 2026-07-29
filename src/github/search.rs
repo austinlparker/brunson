@@ -421,7 +421,7 @@ fn reason_keeps_pr(
         | SearchReason::WatchAuthor { scope }
         | SearchReason::WatchInvolves { scope } => {
             watch_reason_is_configured(config, scope.as_ref())
-                && scope.as_ref().map_or(true, |scope| scope.matches_pr(pr))
+                && scope.as_ref().is_none_or(|scope| scope.matches_pr(pr))
         }
         SearchReason::TargetDirectReview { scope } => {
             target_allows(config, scope, |target| target.direct_review_requests)

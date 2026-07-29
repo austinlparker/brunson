@@ -238,6 +238,8 @@ const PR_DETAIL_QUERY: &str = r#"query(
             body
             path
             line
+            createdAt
+            url
           }
         }
       }
@@ -253,12 +255,14 @@ const PR_DETAIL_QUERY: &str = r#"query(
           author { login }
           body
           createdAt
+          url
         }
         ... on PullRequestReview {
           author { login }
           body
           state
           submittedAt
+          url
         }
         ... on PullRequestCommit {
           commit {
@@ -330,6 +334,8 @@ const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($threadId: ID!, $after: Stri
           body
           path
           line
+          createdAt
+          url
         }
       }
     }
@@ -583,6 +589,8 @@ fn parse_review_threads(nodes: &serde_json::Value) -> Vec<ReviewThread> {
                                     body: c["body"].as_str().unwrap_or("").to_string(),
                                     path: c["path"].as_str().unwrap_or("").to_string(),
                                     line: c["line"].as_i64(),
+                                    created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+                                    url: c["url"].as_str().unwrap_or("").to_string(),
                                 })
                                 .collect()
                         })
@@ -739,11 +747,21 @@ fn parse_timeline(nodes: &serde_json::Value) -> Vec<TimelineEvent> {
                         }
                     };
 
+                    // Only comments and reviews carry a stable web URL; other
+                    // event types fall back to the PR URL in the TUI.
+                    let url = match event_type {
+                        TimelineEventType::Comment | TimelineEventType::Review => {
+                            n["url"].as_str().unwrap_or("").to_string()
+                        }
+                        _ => String::new(),
+                    };
+
                     Some(TimelineEvent {
                         event_type,
                         actor,
                         created_at,
                         detail,
+                        url,
                     })
                 })
                 .collect()
@@ -1322,6 +1340,79 @@ mod tests {
         assert_eq!(threads[0].comments.len(), 1);
         assert_eq!(threads[0].comments[0].author, "bob");
         assert_eq!(threads[0].comments[0].line, Some(42));
+    }
+
+    #[test]
+    fn parse_review_threads_maps_created_at_and_url() {
+        let nodes = json!([{
+            "isResolved": false,
+            "isOutdated": false,
+            "comments": {
+                "nodes": [{
+                    "author": { "login": "bob" },
+                    "body": "Looks good",
+                    "path": "src/main.rs",
+                    "line": 42,
+                    "createdAt": "2024-01-15T10:00:00Z",
+                    "url": "https://github.com/org/repo/pull/1#discussion_r7"
+                }]
+            }
+        }]);
+
+        let threads = parse_review_threads(&nodes);
+        assert_eq!(threads[0].comments[0].created_at, "2024-01-15T10:00:00Z");
+        assert_eq!(
+            threads[0].comments[0].url,
+            "https://github.com/org/repo/pull/1#discussion_r7"
+        );
+
+        // Legacy payloads without the new fields default to empty strings.
+        let legacy = json!([{
+            "isResolved": false,
+            "isOutdated": false,
+            "comments": { "nodes": [{ "author": { "login": "bob" }, "body": "b", "path": "p", "line": 1 }] }
+        }]);
+        let threads = parse_review_threads(&legacy);
+        assert_eq!(threads[0].comments[0].created_at, "");
+        assert_eq!(threads[0].comments[0].url, "");
+    }
+
+    #[test]
+    fn parse_timeline_maps_comment_url() {
+        let nodes = json!([
+            {
+                "__typename": "IssueComment",
+                "author": { "login": "bob" },
+                "body": "hi",
+                "createdAt": "2024-01-15T10:00:00Z",
+                "url": "https://github.com/org/repo/pull/1#issuecomment-9"
+            },
+            {
+                "__typename": "PullRequestReview",
+                "author": { "login": "alice" },
+                "body": "ok",
+                "state": "APPROVED",
+                "submittedAt": "2024-01-15T11:00:00Z",
+                "url": "https://github.com/org/repo/pull/1#pullrequestreview-3"
+            },
+            {
+                "__typename": "MergedEvent",
+                "actor": { "login": "alice" },
+                "createdAt": "2024-01-15T12:00:00Z"
+            }
+        ]);
+
+        let timeline = parse_timeline(&nodes);
+        assert_eq!(
+            timeline[0].url,
+            "https://github.com/org/repo/pull/1#issuecomment-9"
+        );
+        assert_eq!(
+            timeline[1].url,
+            "https://github.com/org/repo/pull/1#pullrequestreview-3"
+        );
+        // Non-comment events carry no URL (TUI falls back to the PR URL).
+        assert_eq!(timeline[2].url, "");
     }
 
     #[test]

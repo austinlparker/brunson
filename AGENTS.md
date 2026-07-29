@@ -145,20 +145,22 @@ done
 
 | # | Blade | Accent | Content |
 |---|-------|--------|---------|
-| 1 | Inbox | blue | Triages PRs into **OPENED BY ME** and **NEEDS MY REVIEW**, sorted by priority |
-| 2 | Overview | peach | PR header, stat tiles, summary/description, checks, last activity |
-| 3 | Activity | mauve | Connected vertical timeline of PR events |
+| 1 | Inbox | blue | PR triage list with a color-coded **NEXT** action column (the daemon's `next_action`) and a bottom preview strip showing the selected PR's one-line LLM summary and head branch |
+| 2 | Overview | peach | PR header, status/stat row, then description-first body: capped Brunson summary, a **PROBLEMS** section (only when checks fail/pend or the PR conflicts), the full scrollable description, last activity |
+| 3 | Activity | mauve | Selectable per-event list (comments, reviews, commits, review threads), newest first, with expand/collapse and per-event actions |
 | 4 | Files | green | Changed-file picker with status, additions, deletions |
 | 5 | Diff | teal | Unified diff with two-number gutter and inline review comments |
 
-Navigation: `←/h` back, `→/l/Enter` deeper, `1`–`5` jump, `j/k`/`↑↓` scroll, `/` filter inbox, `c` config preview, `R` refresh, `q` quit.
+Navigation: `←/h` back, `→/l` deeper (`Enter` also drills in from Inbox/Overview/Files), `1`–`5` jump, `j/k`/`↑↓` move/scroll, `/` filter inbox, `^y` copy the selected PR's branch (works straight from the inbox list), `c` config preview, `R` refresh, `q` quit. In the Activity blade, `j/k` select events, `⏎`/`space` expand/collapse the selected event, `y` copies its full body, and `o` opens the event's URL in a browser (falling back to the PR).
 
-The status line at the bottom shows the selected PR title, current blade, and data staleness; the keybar below it lists bindings. Press `o` to open the selected PR in a browser. (PR titles and file paths are intentionally not rendered as OSC 8 hyperlinks — doing so via `Cell::set_symbol` corrupts ratatui 0.30's cell-width calculation and breaks the selection highlight.)
+The status line at the bottom shows the selected PR title, current blade, review/merge/CI status chips (on wide terminals), and data staleness; the keybar below it lists bindings. Press `o` to open the selected PR in a browser (`O` everywhere; lowercase `o` is event-scoped inside Activity). (PR titles and file paths are intentionally not rendered as OSC 8 hyperlinks — doing so via `Cell::set_symbol` corrupts ratatui 0.30's cell-width calculation and breaks the selection highlight.)
 
-Inside the Inbox, the daemon's eight internal `PrGroup` values are folded into exactly two display sections:
+Inbox rows read `▌ ● #number title @author NEXT age`: the priority dot keeps its LLM color, and the NEXT column renders the daemon's `next_action` label with an urgency color map (red for `Fix CI`/`Address feedback`, accent for `Review now`/`Re-review`/`Respond`, green for `Merge`, muted for `Waiting`), plus a red `✕` suffix when checks fail on a row whose action isn't already `Fix CI`. The two-row preview strip under the list shows the selected PR's `llm_one_line` summary and `repo · branch (age)` — the branch `^y` will copy — and hides on short terminals.
 
-- **OPENED BY ME** = `authored_action_needed`, `authored_ready_to_merge`, `authored_waiting`, plus `draft` PRs authored by the current user.
-- **NEEDS MY REVIEW** = `review_needed`, `review_update`, `review_done`, plus `draft` PRs by others and `other` PRs.
+Inside the Inbox, the daemon's eight internal `PrGroup` values fold into collapsible display sections (mine/review lanes, dependencies, drafts, involved):
+
+- **MINE — …** = `authored_action_needed`, `authored_ready_to_merge`, `authored_waiting`.
+- **REVIEW — …** = `review_needed`, `review_update`, `review_done` (bot-authored review PRs split into **DEPENDENCIES**), plus **DRAFTS** and **INVOLVED**.
 
 ## TUI Rendering Architecture
 
@@ -207,7 +209,9 @@ Every component fully paints its allocated area (via `fill`/`Surface`), so no ma
         "next_action": "Review now",
         "check_status": "pending",
         "llm_priority": "high",
-        "url": "https://github.com/myorg/myrepo/pull/123"
+        "url": "https://github.com/myorg/myrepo/pull/123",
+        "head_ref": "feature/add-x",
+        "llm_one_line": "Adds feature X behind a flag"
       }
     ],
     "authored_ready_to_merge": [...]
@@ -224,6 +228,6 @@ Review-requested lane: `review_needed`, `review_update`, `review_done`
 
 Other: `draft`, `other`
 
-Each PR summary includes `next_action`, a daemon-computed action label such as `Review now`, `Re-review`, `Respond`, `Fix CI`, `Address feedback`, `Merge`, or `Waiting`.
+Each PR summary includes `next_action`, a daemon-computed action label such as `Review now`, `Re-review`, `Respond`, `Fix CI`, `Address feedback`, `Merge`, or `Waiting`, plus `head_ref` (the PR's source branch) and `llm_one_line` (one-line LLM summary, `null` until classified). Both newer fields default safely when absent so old and new daemon/TUI builds interoperate.
 
-Full PR detail responses include a `timeline` array of activity events (`comment`, `review`, `commit`, `force_push`, `review_requested`, etc.) with `actor`, `created_at`, and `detail` fields. For `comment` and `review` events, `detail` contains the **full** comment/review body so it can be rendered with Markdown formatting in the TUI.
+Full PR detail responses include a `timeline` array of activity events (`comment`, `review`, `commit`, `force_push`, `review_requested`, etc.) with `actor`, `created_at`, `detail`, and `url` fields (`url` is the event's web URL for comments/reviews, empty otherwise). For `comment` and `review` events, `detail` contains the **full** comment/review body so it can be rendered with Markdown formatting in the TUI. Review-thread comments likewise carry `created_at` and `url`, which the Activity blade uses to interleave threads with timeline events in true chronological order.

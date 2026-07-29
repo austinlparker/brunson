@@ -428,12 +428,14 @@ mod tests {
                 actor: "me".into(),
                 created_at: "2024-06-01T10:00:00Z".into(),
                 detail: "Initial commit".into(),
+                url: String::new(),
             },
             TimelineEvent {
                 event_type: TimelineEventType::Comment,
                 actor: "bob".into(),
                 created_at: "2024-06-01T11:00:00Z".into(),
                 detail: "Can you fix this?".into(),
+                url: String::new(),
             },
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
@@ -462,12 +464,14 @@ mod tests {
                 actor: "bob".into(),
                 created_at: "2024-06-01T10:00:00Z".into(),
                 detail: "Question?".into(),
+                url: String::new(),
             },
             TimelineEvent {
                 event_type: TimelineEventType::Comment,
                 actor: "me".into(),
                 created_at: "2024-06-01T11:00:00Z".into(),
                 detail: "Answered".into(),
+                url: String::new(),
             },
         ];
         // Review still required, CI green, but not mergeable → Waiting
@@ -571,12 +575,14 @@ mod tests {
                 actor: "other".into(),
                 created_at: "2024-06-01T09:00:00Z".into(),
                 detail: "Initial work".into(),
+                url: String::new(),
             },
             TimelineEvent {
                 event_type: TimelineEventType::Review,
                 actor: "me".into(),
                 created_at: "2024-06-01T10:00:00Z".into(),
                 detail: "APPROVED: Looks good".into(),
+                url: String::new(),
             },
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::ReviewDone);
@@ -604,12 +610,14 @@ mod tests {
                 actor: "me".into(),
                 created_at: "2024-06-01T10:00:00Z".into(),
                 detail: "APPROVED: Looks good".into(),
+                url: String::new(),
             },
             TimelineEvent {
                 event_type: TimelineEventType::Commit,
                 actor: "other".into(),
                 created_at: "2024-06-01T12:00:00Z".into(),
                 detail: "Address feedback".into(),
+                url: String::new(),
             },
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::ReviewUpdate);
@@ -662,6 +670,8 @@ mod tests {
                 body: "Please fix".into(),
                 path: "src/main.rs".into(),
                 line: Some(42),
+                created_at: String::new(),
+                url: String::new(),
             }],
         }];
         assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
@@ -911,6 +921,8 @@ mod tests {
                 body: "thread".into(),
                 path: "src/main.rs".into(),
                 line: Some(10),
+                created_at: String::new(),
+                url: String::new(),
             }],
         }];
         pr.timeline = vec![
@@ -919,12 +931,14 @@ mod tests {
                 actor: " alice ".into(),
                 created_at: recent_time(),
                 detail: "issue comment".into(),
+                url: String::new(),
             },
             TimelineEvent {
                 event_type: TimelineEventType::Commit,
                 actor: "bob".into(),
                 created_at: recent_time(),
                 detail: "commit".into(),
+                url: String::new(),
             },
         ];
         store.update_prs(vec![pr]);

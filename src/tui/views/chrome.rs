@@ -136,10 +136,13 @@ fn stale_age_color(age: Option<chrono::Duration>) -> Color {
     .unwrap_or(OVERLAY0)
 }
 
-/// Render the statusline just above the keybar: `❯ #<number> <title> · <blade>`.
+/// Render the statusline just above the keybar:
+/// `❯ #<number> <title> · <blade> [· <review> · <merge> · <CI>]`.
 /// The number and title come from the loaded detail when available, and
 /// otherwise from the selected summary in the list, so the grammar stays stable
-/// while the detail fetch is in flight.
+/// while the detail fetch is in flight. The review/merge/CI status chips mirror
+/// the Overview status row so PR health is visible from every blade; they are
+/// dropped entirely on narrow terminals (see [`command_line_budget`]).
 pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     let state = ctx.state;
     let accent = ctx.view.active_blade.accent();
@@ -152,13 +155,58 @@ pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
         crate::daemon::SERVICE_NAME.to_string()
     };
 
-    let blade_suffix = format!(" · {}", ctx.view.active_blade.name());
-    // Account for the "❯ " prefix, the blade suffix, and a trailing space.
-    let overhead = 2 + blade_suffix.chars().count() + 1;
-    let max_title_width = area.width.saturating_sub(overhead as u16).max(1) as usize;
-    let display_title = crate::tui::views::text::truncate_to_display_width(&title, max_title_width);
+    let chips: Vec<(String, Color)> = state
+        .pr_detail
+        .as_ref()
+        .map(crate::tui::views::overview::status_chip_data)
+        .unwrap_or_default();
 
-    let spans = vec![
+    let spans = command_line_spans(
+        &title,
+        ctx.view.active_blade.name(),
+        accent,
+        &chips,
+        area.width,
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BASE)),
+        area,
+    );
+}
+
+/// Pure width budget for the command line: chips reserve their width first,
+/// the title truncates to the remainder, and chips are dropped entirely when
+/// `area_width < 60`. Returns `(show_chips, max_title_width)`.
+fn command_line_budget(
+    area_width: u16,
+    blade_suffix_width: usize,
+    chips: &[(String, Color)],
+) -> (bool, usize) {
+    // "❯ " prefix + blade suffix + a trailing space.
+    let overhead = 2 + blade_suffix_width + 1;
+    let chips_width: usize = chips.iter().map(|(t, _)| 3 + t.chars().count()).sum();
+    let show_chips = area_width >= 60 && !chips.is_empty();
+    let reserved = overhead + if show_chips { chips_width } else { 0 };
+    let max_title = (area_width as usize).saturating_sub(reserved).max(1);
+    (show_chips, max_title)
+}
+
+/// Build the command-line spans from resolved inputs. Pure so the chip
+/// appending/dropping behavior is unit-testable.
+fn command_line_spans(
+    title: &str,
+    blade_name: &str,
+    accent: Color,
+    chips: &[(String, Color)],
+    width: u16,
+) -> Vec<Span<'static>> {
+    let blade_suffix = format!(" · {}", blade_name);
+    let (show_chips, max_title_width) =
+        command_line_budget(width, blade_suffix.chars().count(), chips);
+    let display_title = crate::tui::views::text::truncate_to_display_width(title, max_title_width);
+
+    let mut spans = vec![
         Span::styled("❯ ", Style::default().fg(TEXT).add_modifier(Modifier::DIM)),
         Span::styled(
             display_title,
@@ -166,11 +214,19 @@ pub fn render_command_line(f: &mut Frame, area: Rect, ctx: &RenderContext) {
         ),
         Span::styled(blade_suffix, Style::default().fg(accent)),
     ];
-
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(BASE)),
-        area,
-    );
+    if show_chips {
+        for (text, color) in chips {
+            spans.push(Span::styled(" · ", Style::default().fg(OVERLAY0).bg(BASE)));
+            spans.push(Span::styled(
+                text.clone(),
+                Style::default()
+                    .fg(*color)
+                    .bg(BASE)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    spans
 }
 
 /// Find the currently selected PR in the list snapshot the inbox renders from.
@@ -254,8 +310,8 @@ pub fn render_keybar(f: &mut Frame, area: Rect, ctx: &RenderContext) {
     );
 }
 
-/// Blade-specific key hints. Some bindings (g/G outside diff, `r` refresh, `d`
-/// description) are documented ahead of the handlers that implement them.
+/// Blade-specific key hints. Some bindings (g/G outside diff, `r` refresh)
+/// are documented ahead of the handlers that implement them.
 fn blade_keys(blade: Blade) -> &'static [(&'static str, &'static str)] {
     match blade {
         Blade::Inbox => &[
@@ -274,17 +330,18 @@ fn blade_keys(blade: Blade) -> &'static [(&'static str, &'static str)] {
         Blade::Overview => &[
             ("j/k", "scroll"),
             ("tab", "section"),
-            ("d", "description"),
             ("←/→", "blade"),
             ("o", "browser"),
             ("?", "help"),
             ("q", "quit"),
         ],
         Blade::Activity => &[
-            ("j/k", "scroll"),
+            ("j/k", "event"),
             ("g/G", "top/bot"),
+            ("⏎/space", "expand"),
+            ("y", "copy comment"),
+            ("o", "open event"),
             ("←/→", "blade"),
-            ("o", "browser"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -341,5 +398,72 @@ mod tests {
         for i in 0..Blade::count() {
             assert!(!blade_keys(Blade::from_index(i)).is_empty());
         }
+    }
+
+    #[test]
+    fn keybar_activity_includes_event_actions() {
+        let keys = blade_keys(Blade::Activity);
+        let find = |key: &str| keys.iter().find(|(k, _)| *k == key).map(|(_, a)| *a);
+        assert_eq!(find("⏎/space"), Some("expand"));
+        assert_eq!(find("y"), Some("copy comment"));
+        assert_eq!(find("o"), Some("open event"));
+    }
+
+    #[test]
+    fn keybar_overview_no_longer_lists_d() {
+        assert!(!blade_keys(Blade::Overview).iter().any(|(k, _)| *k == "d"));
+    }
+
+    fn sample_chips() -> Vec<(String, Color)> {
+        vec![
+            ("approved".to_string(), Color::Green),
+            ("mergeable".to_string(), Color::Green),
+            ("checks ✓".to_string(), Color::Green),
+        ]
+    }
+
+    #[test]
+    fn command_line_appends_status_chips_when_wide() {
+        let spans = command_line_spans(
+            "❖ #1 Test PR",
+            "OVERVIEW",
+            Color::Cyan,
+            &sample_chips(),
+            120,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("approved"));
+        assert!(text.contains("mergeable"));
+        assert!(text.contains("checks ✓"));
+    }
+
+    #[test]
+    fn command_line_drops_chips_when_narrow() {
+        // Below the 60-col threshold the chips vanish and the title keeps
+        // the full remaining budget.
+        let (show, max_title) = command_line_budget(59, 11, &sample_chips());
+        assert!(!show);
+        assert_eq!(max_title, 59 - (2 + 11 + 1));
+
+        let spans =
+            command_line_spans("❖ #1 Test PR", "OVERVIEW", Color::Cyan, &sample_chips(), 59);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.contains("approved"));
+
+        // At or above the threshold the chips reserve width first.
+        let (show, max_title) = command_line_budget(80, 11, &sample_chips());
+        assert!(show);
+        let chips_width = sample_chips()
+            .iter()
+            .map(|(t, _)| 3 + t.chars().count())
+            .sum::<usize>();
+        assert_eq!(max_title, 80 - (2 + 11 + 1) - chips_width);
+    }
+
+    #[test]
+    fn command_line_without_chips_matches_old_budget() {
+        let (show, max_title) = command_line_budget(120, 11, &[]);
+        assert!(!show, "no detail loaded ⇒ no chips even when wide");
+        assert_eq!(max_title, 120 - (2 + 11 + 1));
     }
 }

@@ -180,6 +180,13 @@ pub struct ReviewComment {
     pub body: String,
     pub path: String,
     pub line: Option<i64>,
+    /// ISO 8601 timestamp of the comment. Defaults to empty so store JSON
+    /// written before this field existed still deserializes.
+    #[serde(default)]
+    pub created_at: String,
+    /// Web URL of the comment. Defaults to empty for legacy store JSON.
+    #[serde(default)]
+    pub url: String,
 }
 
 fn default_file_status() -> char {
@@ -248,6 +255,10 @@ pub struct TimelineEvent {
     pub created_at: String,
     /// Human-readable detail: review state, commit message headline, comment excerpt, etc.
     pub detail: String,
+    /// Web URL of the event (comments and reviews only; empty for other
+    /// event types and for legacy store JSON).
+    #[serde(default)]
+    pub url: String,
 }
 
 /// The full PullRequest model stored in the daemon.
@@ -347,6 +358,20 @@ pub struct TeamMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_comment_defaults_for_legacy_json() {
+        // Persisted store JSON written before created_at/url existed must
+        // still deserialize, with the new fields defaulting to empty.
+        let json = r#"{"author":"bob","body":"fix","path":"src/main.rs","line":3}"#;
+        let comment: ReviewComment = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(comment.created_at, "");
+        assert_eq!(comment.url, "");
+
+        let json = r#"{"event_type":"comment","actor":"bob","created_at":"2024-01-01T00:00:00Z","detail":"hi"}"#;
+        let event: TimelineEvent = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(event.url, "");
+    }
 
     #[test]
     fn test_parse_slug_valid() {

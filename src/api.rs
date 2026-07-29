@@ -153,6 +153,14 @@ pub struct PrSummary {
     pub url: String,
     #[serde(default)]
     pub comments: u32,
+    /// Head branch name, so the TUI can copy a branch before the detail
+    /// response is loaded. Defaults to empty for older daemons.
+    #[serde(default)]
+    pub head_ref: String,
+    /// One-line LLM summary for the inbox preview strip. Defaults to `None`
+    /// for older daemons.
+    #[serde(default)]
+    pub llm_one_line: Option<String>,
 }
 
 impl PrSummary {
@@ -236,6 +244,12 @@ pub struct ReviewCommentDto {
     pub body: String,
     pub path: String,
     pub line: Option<i64>,
+    /// ISO 8601 timestamp; empty when talking to an older daemon.
+    #[serde(default)]
+    pub created_at: String,
+    /// Web URL of the comment; empty when talking to an older daemon.
+    #[serde(default)]
+    pub url: String,
 }
 
 fn default_file_status() -> char {
@@ -257,6 +271,10 @@ pub struct TimelineEventDto {
     pub actor: String,
     pub created_at: String,
     pub detail: String,
+    /// Web URL of the event (comments/reviews only); empty when talking to
+    /// an older daemon or for event types with no stable URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// GET /prs/{id}/diff
@@ -367,6 +385,8 @@ mod tests {
             updated_at: "2024-01-01T00:00:00Z".into(),
             url: "https://example.com".into(),
             comments: 0,
+            head_ref: String::new(),
+            llm_one_line: None,
         }
     }
 
@@ -449,12 +469,46 @@ mod tests {
                 actor: "a".into(),
                 created_at: "2024-01-01T00:00:00Z".into(),
                 detail: "hi".into(),
+                url: String::new(),
             }],
             llm_priority: None,
             llm_summary: None,
             llm_rich_summary: None,
             last_seen_at: None,
         }
+    }
+
+    #[test]
+    fn detail_dtos_default_missing_fields_from_legacy_json() {
+        // Payloads from an old daemon lack the new fields; the TUI-side DTOs
+        // must still deserialize with empty defaults.
+        let json = r#"{"author":"bob","body":"fix","path":"src/main.rs","line":3}"#;
+        let comment: ReviewCommentDto = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(comment.created_at, "");
+        assert_eq!(comment.url, "");
+
+        let json = r#"{"event_type":"comment","actor":"bob","created_at":"2024-01-01T00:00:00Z","detail":"hi"}"#;
+        let event: TimelineEventDto = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(event.url, "");
+
+        // PrSummary from an old daemon lacks head_ref/llm_one_line.
+        let json = r#"{
+            "id": "org~repo~1",
+            "node_id": "n1",
+            "owner": "org",
+            "repo": "repo",
+            "number": 1,
+            "title": "T",
+            "author": "a",
+            "group": "review_needed",
+            "next_action": "Review now",
+            "check_status": "none",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "url": "https://example.com"
+        }"#;
+        let summary: PrSummary = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(summary.head_ref, "");
+        assert_eq!(summary.llm_one_line, None);
     }
 
     #[test]
