@@ -19,16 +19,6 @@ impl SearchScope {
         }
     }
 
-    fn matches_result(&self, result: &SearchResult) -> bool {
-        match self {
-            Self::Org(org) => org.eq_ignore_ascii_case(&result.repo_owner),
-            Self::Repo { owner, repo } => {
-                owner.eq_ignore_ascii_case(&result.repo_owner)
-                    && repo.eq_ignore_ascii_case(&result.repo_name)
-            }
-        }
-    }
-
     fn matches_pr(&self, pr: &PullRequest) -> bool {
         match self {
             Self::Org(org) => org.eq_ignore_ascii_case(&pr.owner),
@@ -323,51 +313,13 @@ fn search_result_key(result: &SearchResult) -> (String, String, u64) {
     )
 }
 
-/// Enforce repository/org scope locally after GitHub search returns.
-///
-/// GitHub search qualifiers should already enforce this, but the store's scope
-/// should be Brunson's invariant rather than an assumption about an upstream
-/// response.
-pub fn filter_results_for_config(
-    results: Vec<SearchResult>,
-    config: &GithubConfig,
-) -> Vec<SearchResult> {
-    if config.watch.is_empty() && config.targets.is_empty() {
-        return results;
-    }
-
-    results
-        .into_iter()
-        .filter(|result| result_matches_config(result, config))
-        .collect()
-}
-
-fn result_matches_config(result: &SearchResult, config: &GithubConfig) -> bool {
-    config
-        .watch
-        .iter()
-        .any(|entry| result_matches_watch_entry(result, entry))
-        || config
-            .targets
-            .iter()
-            .any(|target| result_matches_target(result, target))
-}
-
-fn result_matches_watch_entry(result: &SearchResult, entry: &str) -> bool {
-    scope_from_entry(entry)
-        .as_ref()
-        .map(|scope| scope.matches_result(result))
-        .unwrap_or(false)
-}
-
-fn result_matches_target(result: &SearchResult, target: &GithubTarget) -> bool {
-    target_scope(target)
-        .as_ref()
-        .map(|scope| scope.matches_result(result))
-        .unwrap_or(false)
-}
-
 /// Keep hydrated PRs only when at least one concrete matched query reason is still valid.
+///
+/// This is the single scope gate: search results are hydrated as returned by
+/// GitHub (the generated queries already carry `repo:`/`org:` qualifiers), and
+/// any hit those qualifiers should have excluded is dropped here. The worst
+/// case for a leaked hit is one wasted hydration request, never an
+/// out-of-scope PR in the store.
 pub fn filter_prs_by_provenance(
     prs: Vec<PullRequest>,
     provenance: &[ProvenancedSearchResult],
@@ -517,47 +469,6 @@ mod tests {
         assert!(queries
             .iter()
             .any(|q| q == "team-review-requested:myorg/platform is:pr is:open repo:myorg/repo-b"));
-    }
-
-    #[test]
-    fn test_filter_results_for_config_enforces_repo_scope() {
-        let mut config = crate::config::GithubConfig::default();
-        config.targets.push(crate::config::GithubTarget {
-            repo: Some("myorg/repo-a".to_string()),
-            ..Default::default()
-        });
-
-        let results = filter_results_for_config(
-            vec![
-                search_result("myorg", "repo-a", 1),
-                search_result("myorg", "repo-b", 2),
-                search_result("other", "repo-a", 3),
-            ],
-            &config,
-        );
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].repo_name, "repo-a");
-    }
-
-    #[test]
-    fn test_filter_results_for_config_keeps_org_scope() {
-        let config = crate::config::GithubConfig {
-            watch: vec!["myorg".to_string()],
-            ..Default::default()
-        };
-
-        let results = filter_results_for_config(
-            vec![
-                search_result("myorg", "repo-a", 1),
-                search_result("myorg", "repo-b", 2),
-                search_result("other", "repo-a", 3),
-            ],
-            &config,
-        );
-
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.repo_owner == "myorg"));
     }
 
     #[test]
@@ -937,5 +848,56 @@ mod tests {
             author: "user".into(),
             updated_at: "2024-01-01T00:00:00Z".into(),
         }
+    }
+
+    // The provenance filter is the single scope gate (there is no search
+    // result pre-filter): a hydrated PR outside every configured scope must
+    // be dropped here even when its provenance key matches.
+    #[test]
+    fn provenance_filter_drops_out_of_scope_pr() {
+        let config = crate::config::GithubConfig {
+            watch: vec!["myorg".to_string()],
+            ..Default::default()
+        };
+        let pr = PullRequest {
+            owner: "otherorg".into(),
+            ..pull_request("me", vec![], vec![])
+        };
+        let filtered = filter_prs_by_provenance(
+            vec![pr],
+            &[ProvenancedSearchResult::new(
+                search_result("otherorg", "repo", 1),
+                SearchReason::WatchAuthor {
+                    scope: Some(SearchScope::Org("myorg".into())),
+                },
+            )],
+            &config,
+            "me",
+            &HashSet::new(),
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    // Broad empty-watch config: unscoped watch queries match everything, so
+    // hydrated PRs flow through the provenance filter and are kept.
+    #[test]
+    fn provenance_filter_keeps_prs_for_broad_empty_watch_config() {
+        let config = crate::config::GithubConfig::default();
+        assert!(config.watch.is_empty() && config.targets.is_empty());
+
+        let pr = pull_request("me", vec![], vec![]);
+        let filtered = filter_prs_by_provenance(
+            vec![pr],
+            &[ProvenancedSearchResult::new(
+                search_result("myorg", "repo", 1),
+                SearchReason::WatchAuthor { scope: None },
+            )],
+            &config,
+            "me",
+            &HashSet::new(),
+        );
+
+        assert_eq!(filtered.len(), 1);
     }
 }

@@ -13,7 +13,7 @@ use crate::github::client::GitHubClient;
 use crate::github::graphql::{fetch_pr_details, fetch_viewer_team_memberships};
 use crate::github::search::{
     build_query_specs_for_config, configured_team_review_requests, dedup_provenanced_results,
-    filter_prs_by_provenance, filter_results_for_config, ProvenancedSearchResult,
+    filter_prs_by_provenance, ProvenancedSearchResult,
 };
 use crate::github::types::PullRequest;
 use crate::llm::classifier::{Classifier, CLASSIFY_BATCH_SIZE};
@@ -178,31 +178,12 @@ async fn run_poll_cycle(
             );
         }
 
-        // De-duplicate while preserving query provenance.
+        // De-duplicate while preserving query provenance. Scope is enforced
+        // once, after hydration, by filter_prs_by_provenance below.
         let provenance = dedup_provenanced_results(all_results);
-        let results = filter_results_for_config(
-            provenance.iter().map(|item| item.result.clone()).collect(),
-            &config.github,
-        );
-        let result_keys: HashSet<_> = results
+        let results: Vec<_> = provenance
             .iter()
-            .map(|r| {
-                (
-                    r.repo_owner.to_ascii_lowercase(),
-                    r.repo_name.to_ascii_lowercase(),
-                    r.number,
-                )
-            })
-            .collect();
-        let provenance: Vec<_> = provenance
-            .into_iter()
-            .filter(|item| {
-                result_keys.contains(&(
-                    item.result.repo_owner.to_ascii_lowercase(),
-                    item.result.repo_name.to_ascii_lowercase(),
-                    item.result.number,
-                ))
-            })
+            .map(|item| item.result.clone())
             .collect();
 
         info!(
