@@ -69,9 +69,11 @@
   "timeline": [
     {
       "actor": "carol",
+      "actor_is_bot": false,
       "created_at": "2024-06-24T11:00:00Z",
       "detail": "changes_requested: Please fix",
       "event_type": "review",
+      "review_state": "CHANGES_REQUESTED",
       "url": "https://github.com/org/repo/pull/42#pullrequestreview-1"
     }
   ],

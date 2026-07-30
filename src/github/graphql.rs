@@ -178,8 +178,8 @@ macro_rules! timeline_items_connection {
             "timelineItems(first: 100", $pagination, ") {",
             " pageInfo { hasNextPage endCursor }",
             " nodes { __typename",
-            " ... on IssueComment { author { login } body createdAt url }",
-            " ... on PullRequestReview { author { login } body state submittedAt url }",
+            " ... on IssueComment { author { login __typename } body createdAt url }",
+            " ... on PullRequestReview { author { login __typename } body state submittedAt url }",
             " ... on PullRequestCommit { commit { author { user { login } } messageHeadline committedDate } }",
             " ... on HeadRefForcePushedEvent { actor { login } createdAt }",
             " ... on ReadyForReviewEvent { actor { login } createdAt }",
@@ -723,12 +723,25 @@ fn parse_timeline(nodes: &serde_json::Value) -> Vec<TimelineEvent> {
                         _ => String::new(),
                     };
 
+                    // Bot detection mirrors the PR-level `author_is_bot`
+                    // parse: GraphQL App actors report `__typename: "Bot"`.
+                    // Only comment/review authors are queried for it.
+                    let actor_is_bot = matches!(typename, "IssueComment" | "PullRequestReview")
+                        && n["author"]["__typename"].as_str() == Some("Bot");
+                    let review_state = if typename == "PullRequestReview" {
+                        Some(n["state"].as_str().unwrap_or("COMMENTED").to_string())
+                    } else {
+                        None
+                    };
+
                     Some(TimelineEvent {
                         event_type,
                         actor,
                         created_at,
                         detail,
                         url,
+                        actor_is_bot,
+                        review_state,
                     })
                 })
                 .collect()
@@ -1336,6 +1349,69 @@ mod tests {
         assert_eq!(timeline[3].event_type, TimelineEventType::ReviewRequested);
         assert_eq!(timeline[3].actor, "alice");
         assert!(timeline[3].detail.contains("bob"));
+    }
+
+    #[test]
+    fn parse_timeline_sets_actor_is_bot_and_review_state() {
+        let nodes = json!([
+            {
+                "__typename": "IssueComment",
+                "author": { "login": "linear-app", "__typename": "Bot" },
+                "body": "Linked to LIN-123",
+                "createdAt": "2024-01-15T10:00:00Z"
+            },
+            {
+                "__typename": "IssueComment",
+                "author": { "login": "bob", "__typename": "User" },
+                "body": "Looks off",
+                "createdAt": "2024-01-15T11:00:00Z"
+            },
+            {
+                "__typename": "PullRequestReview",
+                "author": { "login": "some-ci-bot", "__typename": "Bot" },
+                "body": "",
+                "state": "COMMENTED",
+                "submittedAt": "2024-01-15T12:00:00Z"
+            },
+            {
+                "__typename": "PullRequestReview",
+                "author": { "login": "alice", "__typename": "User" },
+                "body": "Ship it",
+                "state": "APPROVED",
+                "submittedAt": "2024-01-15T13:00:00Z"
+            },
+            {
+                "__typename": "PullRequestCommit",
+                "commit": {
+                    "author": { "user": { "login": "alice" } },
+                    "messageHeadline": "Fix typo",
+                    "committedDate": "2024-01-15T09:00:00Z"
+                }
+            }
+        ]);
+
+        let timeline = parse_timeline(&nodes);
+        assert_eq!(timeline.len(), 5);
+
+        // Bot comment
+        assert!(timeline[0].actor_is_bot);
+        assert_eq!(timeline[0].review_state, None);
+
+        // Human comment
+        assert!(!timeline[1].actor_is_bot);
+        assert_eq!(timeline[1].review_state, None);
+
+        // Bot review carries both flags
+        assert!(timeline[2].actor_is_bot);
+        assert_eq!(timeline[2].review_state.as_deref(), Some("COMMENTED"));
+
+        // Human review carries structured state
+        assert!(!timeline[3].actor_is_bot);
+        assert_eq!(timeline[3].review_state.as_deref(), Some("APPROVED"));
+
+        // Non-interaction events: never bot, no review state
+        assert!(!timeline[4].actor_is_bot);
+        assert_eq!(timeline[4].review_state, None);
     }
 
     #[test]

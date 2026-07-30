@@ -420,6 +420,8 @@ mod tests {
                 created_at: "2024-06-24T11:00:00Z".into(),
                 detail: "changes_requested: Please fix".into(),
                 url: "https://github.com/org/repo/pull/42#pullrequestreview-1".into(),
+                actor_is_bot: false,
+                review_state: Some("CHANGES_REQUESTED".into()),
             }],
             llm_priority: Some(Priority::High),
             llm_summary: Some("Feature X implementation".into()),

@@ -722,6 +722,8 @@ mod tests {
             created_at: created_at.to_string(),
             detail: detail.to_string(),
             url: String::new(),
+            actor_is_bot: false,
+            review_state: None,
         }
     }
 

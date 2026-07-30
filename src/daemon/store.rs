@@ -159,6 +159,11 @@ impl PrStore {
 
     // ── Authored lane ──
 
+    /// Classify an authored PR, in precedence order:
+    /// CI failure → changes requested → ready-to-merge → ball-in-my-court →
+    /// waiting. Ready-to-merge is decided *before* ball-in-my-court so an
+    /// approved, green, mergeable PR reads "Merge" even when the approving
+    /// review is the newest timeline event.
     fn classify_authored(&self, pr: &PullRequest, user: &str) -> PrGroup {
         // CI failed → highest urgency
         if pr.check_status == CheckStatus::Failure {
@@ -170,17 +175,17 @@ impl PrStore {
             return PrGroup::AuthoredActionNeeded;
         }
 
-        // Ball in my court: someone commented/reviewed and I haven't responded
-        if self.ball_in_my_court(pr, user) {
-            return PrGroup::AuthoredActionNeeded;
-        }
-
         // Approved (or no review required) + CI green + mergeable → ready
         if (pr.review_decision == Some(ReviewDecision::Approved) || pr.review_decision.is_none())
             && pr.check_status == CheckStatus::Success
             && pr.mergeable == MergeableState::Mergeable
         {
             return PrGroup::AuthoredReadyToMerge;
+        }
+
+        // Ball in my court: a human asked something and I haven't responded
+        if self.ball_in_my_court(pr, user) {
+            return PrGroup::AuthoredActionNeeded;
         }
 
         PrGroup::AuthoredWaiting
@@ -203,29 +208,81 @@ impl PrStore {
 
     // ── Timeline helpers ──
 
-    /// Determine if the "ball" is in the user's court on an authored PR.
-    /// True when the most recent interaction (comment or review) was performed
-    /// by someone other than the current user.
+    /// Determine if the "ball" is in the user's court on an authored PR:
+    /// someone asked something of the user more recently than the user last
+    /// responded.
+    ///
+    /// **Demanding events** are top-level timeline comments or reviews from a
+    /// non-bot actor other than the user. Reviews in `APPROVED`, `DISMISSED`,
+    /// or `PENDING` state do not demand a response; `CHANGES_REQUESTED` and
+    /// `COMMENTED` reviews do (a bare COMMENTED review typically accompanies
+    /// inline thread comments, so it counts even with an empty body). A
+    /// review with no recorded `review_state` is conservatively treated as
+    /// demanding (legacy payloads only — fresh GraphQL parses always set it).
+    ///
+    /// **Response events** are the user's own comments, reviews, commits, and
+    /// force-pushes: pushing new work counts as answering feedback.
+    ///
+    /// Scope: inline review-thread comments are *not* part of the demand
+    /// stream (they carry no bot flag and live outside the timeline). The
+    /// review-thread fallback below runs only when the timeline has zero
+    /// comment/review events at all — not "zero demanding events" — so
+    /// already-responded threads don't newly become actionable.
     fn ball_in_my_court(&self, pr: &PullRequest, user: &str) -> bool {
-        let last_interaction = pr
+        let has_interactions = pr.timeline.iter().any(|e| {
+            matches!(
+                e.event_type,
+                TimelineEventType::Comment | TimelineEventType::Review
+            )
+        });
+        if !has_interactions {
+            // No timeline interactions — fall back to checking unresolved review threads
+            return pr.review_threads.iter().any(|t| {
+                !t.is_resolved && t.comments.last().map(|c| c.author != user).unwrap_or(false)
+            });
+        }
+
+        let Some(latest_demand) = pr
             .timeline
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.event_type,
-                    TimelineEventType::Comment | TimelineEventType::Review
-                )
-            })
-            .max_by(|a, b| a.created_at.cmp(&b.created_at));
+            .filter(|e| Self::demands_response(e, user))
+            .map(|e| e.created_at.as_str())
+            .max()
+        else {
+            return false;
+        };
 
-        match last_interaction {
-            Some(e) => e.actor != user,
-            None => {
-                // No timeline interactions — fall back to checking unresolved review threads
-                pr.review_threads.iter().any(|t| {
-                    !t.is_resolved && t.comments.last().map(|c| c.author != user).unwrap_or(false)
-                })
-            }
+        // Timestamps are ISO-8601 strings compared lexically (same pattern as
+        // `has_new_activity_since_review`). `>=` so an exact-timestamp tie
+        // between demand and response resolves to "responded" rather than
+        // leaving the ball stuck in the user's court.
+        let responded = pr.timeline.iter().any(|e| {
+            e.actor == user
+                && matches!(
+                    e.event_type,
+                    TimelineEventType::Comment
+                        | TimelineEventType::Review
+                        | TimelineEventType::Commit
+                        | TimelineEventType::ForcePush
+                )
+                && e.created_at.as_str() >= latest_demand
+        });
+        !responded
+    }
+
+    /// Whether a timeline event asks something of `user` (see
+    /// [`Self::ball_in_my_court`] for the full semantics).
+    fn demands_response(e: &TimelineEvent, user: &str) -> bool {
+        if e.actor == user || e.actor_is_bot {
+            return false;
+        }
+        match e.event_type {
+            TimelineEventType::Comment => true,
+            TimelineEventType::Review => !matches!(
+                e.review_state.as_deref(),
+                Some("APPROVED") | Some("DISMISSED") | Some("PENDING")
+            ),
+            _ => false,
         }
     }
 
@@ -339,6 +396,43 @@ mod tests {
         Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
+    /// Timeline event builder: non-bot actor, no review state.
+    fn ev(
+        event_type: TimelineEventType,
+        actor: &str,
+        created_at: &str,
+        detail: &str,
+    ) -> TimelineEvent {
+        TimelineEvent {
+            event_type,
+            actor: actor.into(),
+            created_at: created_at.into(),
+            detail: detail.into(),
+            url: String::new(),
+            actor_is_bot: false,
+            review_state: None,
+        }
+    }
+
+    /// Review event builder with a structured review state.
+    fn review_ev(actor: &str, created_at: &str, state: &str) -> TimelineEvent {
+        let mut e = ev(TimelineEventType::Review, actor, created_at, state);
+        e.review_state = Some(state.into());
+        e
+    }
+
+    /// Bot-authored variant of `ev`.
+    fn bot_ev(
+        event_type: TimelineEventType,
+        actor: &str,
+        created_at: &str,
+        detail: &str,
+    ) -> TimelineEvent {
+        let mut e = ev(event_type, actor, created_at, detail);
+        e.actor_is_bot = true;
+        e
+    }
+
     #[test]
     fn test_draft_precedence() {
         let store = PrStore::new("me".into());
@@ -414,20 +508,18 @@ mod tests {
         );
         // Someone commented after the PR was created
         pr.timeline = vec![
-            TimelineEvent {
-                event_type: TimelineEventType::Commit,
-                actor: "me".into(),
-                created_at: "2024-06-01T10:00:00Z".into(),
-                detail: "Initial commit".into(),
-                url: String::new(),
-            },
-            TimelineEvent {
-                event_type: TimelineEventType::Comment,
-                actor: "bob".into(),
-                created_at: "2024-06-01T11:00:00Z".into(),
-                detail: "Can you fix this?".into(),
-                url: String::new(),
-            },
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Initial commit",
+            ),
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T11:00:00Z",
+                "Can you fix this?",
+            ),
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
         assert_eq!(store.next_action(&pr), "Respond");
@@ -450,23 +542,286 @@ mod tests {
         );
         // I responded after someone commented — ball is in their court
         pr.timeline = vec![
-            TimelineEvent {
-                event_type: TimelineEventType::Comment,
-                actor: "bob".into(),
-                created_at: "2024-06-01T10:00:00Z".into(),
-                detail: "Question?".into(),
-                url: String::new(),
-            },
-            TimelineEvent {
-                event_type: TimelineEventType::Comment,
-                actor: "me".into(),
-                created_at: "2024-06-01T11:00:00Z".into(),
-                detail: "Answered".into(),
-                url: String::new(),
-            },
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T10:00:00Z",
+                "Question?",
+            ),
+            ev(
+                TimelineEventType::Comment,
+                "me",
+                "2024-06-01T11:00:00Z",
+                "Answered",
+            ),
         ];
-        // Review still required, CI green, but not mergeable → Waiting
+        // Review still required → Waiting
         assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+    }
+
+    /// Shared shape for the ball-in-my-court tests: authored, green CI,
+    /// review required, mergeable — classification is decided entirely by
+    /// the timeline.
+    fn authored_review_required_pr() -> PullRequest {
+        make_pr(
+            "1",
+            1,
+            "me",
+            false,
+            CheckStatus::Success,
+            vec![],
+            None,
+            Some(ReviewDecision::ReviewRequired),
+            MergeableState::Mergeable,
+            &recent_time(),
+        )
+    }
+
+    // AC.1 — bot interactions never demand a response (the PR-37250 shape:
+    // green CI, REVIEW_REQUIRED, mergeable; bot comments are the only
+    // comment/review events).
+    #[test]
+    fn bot_comment_does_not_demand_response() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            bot_ev(
+                TimelineEventType::Comment,
+                "linear-app",
+                "2024-06-01T11:00:00Z",
+                "Linked to LIN-123",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+        assert_eq!(store.next_action(&pr), "Waiting");
+    }
+
+    #[test]
+    fn bot_review_does_not_demand_response() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        let mut bot_review = bot_ev(
+            TimelineEventType::Review,
+            "some-ci-bot",
+            "2024-06-01T11:00:00Z",
+            "COMMENTED: automated report",
+        );
+        bot_review.review_state = Some("COMMENTED".into());
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            bot_review,
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+        assert_eq!(store.next_action(&pr), "Waiting");
+    }
+
+    // AC.2 — the author's own pushes count as responses.
+    #[test]
+    fn author_commit_clears_ball() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T10:00:00Z",
+                "Please fix X",
+            ),
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T11:00:00Z",
+                "Fix X",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+    }
+
+    #[test]
+    fn author_force_push_clears_ball() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T10:00:00Z",
+                "Please fix X",
+            ),
+            ev(
+                TimelineEventType::ForcePush,
+                "me",
+                "2024-06-01T11:00:00Z",
+                "Force pushed",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+    }
+
+    #[test]
+    fn human_comment_after_author_push_demands_response() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T11:00:00Z",
+                "One more thing",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
+        assert_eq!(store.next_action(&pr), "Respond");
+    }
+
+    #[test]
+    fn same_timestamp_response_wins_tie() {
+        let store = PrStore::new("me".into());
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Comment,
+                "bob",
+                "2024-06-01T10:00:00Z",
+                "Please fix X",
+            ),
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Fix X",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+    }
+
+    // AC.3 — ready-to-merge takes precedence over ball-in-my-court, and an
+    // approval doesn't demand a response even as the newest event.
+    #[test]
+    fn approved_green_mergeable_is_merge_even_when_approval_is_latest_event() {
+        let store = PrStore::new("me".into());
+        let mut pr = make_pr(
+            "1",
+            1,
+            "me",
+            false,
+            CheckStatus::Success,
+            vec![],
+            None,
+            Some(ReviewDecision::Approved),
+            MergeableState::Mergeable,
+            &recent_time(),
+        );
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            review_ev("alice", "2024-06-01T11:00:00Z", "APPROVED"),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredReadyToMerge);
+        assert_eq!(store.next_action(&pr), "Merge");
+    }
+
+    // AC.4 — approved but CI still pending: waiting, not action-needed.
+    #[test]
+    fn approval_with_pending_ci_is_waiting() {
+        let store = PrStore::new("me".into());
+        let mut pr = make_pr(
+            "1",
+            1,
+            "me",
+            false,
+            CheckStatus::Pending,
+            vec![],
+            None,
+            Some(ReviewDecision::Approved),
+            MergeableState::Mergeable,
+            &recent_time(),
+        );
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            review_ev("alice", "2024-06-01T11:00:00Z", "APPROVED"),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredWaiting);
+    }
+
+    // AC.5 — a human COMMENTED review (with or without body) still demands a
+    // response, as does a review with no recorded state (legacy payloads).
+    #[test]
+    fn commented_review_demands_response() {
+        let store = PrStore::new("me".into());
+
+        // With body
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            review_ev("bob", "2024-06-01T11:00:00Z", "COMMENTED"),
+        ];
+        pr.timeline[1].detail = "COMMENTED: see inline notes".into();
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
+        assert_eq!(store.next_action(&pr), "Respond");
+
+        // Empty body (bare COMMENTED review accompanying inline threads)
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            review_ev("bob", "2024-06-01T11:00:00Z", "COMMENTED"),
+        ];
+        pr.timeline[1].detail = String::new();
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
+
+        // Legacy review with no structured state is conservatively demanding
+        let mut pr = authored_review_required_pr();
+        pr.timeline = vec![
+            ev(
+                TimelineEventType::Commit,
+                "me",
+                "2024-06-01T10:00:00Z",
+                "Implement",
+            ),
+            ev(
+                TimelineEventType::Review,
+                "bob",
+                "2024-06-01T11:00:00Z",
+                "COMMENTED",
+            ),
+        ];
+        assert_eq!(store.classify_pr(&pr), PrGroup::AuthoredActionNeeded);
     }
 
     #[test]
@@ -561,20 +916,13 @@ mod tests {
             &recent_time(),
         );
         pr.timeline = vec![
-            TimelineEvent {
-                event_type: TimelineEventType::Commit,
-                actor: "other".into(),
-                created_at: "2024-06-01T09:00:00Z".into(),
-                detail: "Initial work".into(),
-                url: String::new(),
-            },
-            TimelineEvent {
-                event_type: TimelineEventType::Review,
-                actor: "me".into(),
-                created_at: "2024-06-01T10:00:00Z".into(),
-                detail: "APPROVED: Looks good".into(),
-                url: String::new(),
-            },
+            ev(
+                TimelineEventType::Commit,
+                "other",
+                "2024-06-01T09:00:00Z",
+                "Initial work",
+            ),
+            review_ev("me", "2024-06-01T10:00:00Z", "APPROVED"),
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::ReviewDone);
     }
@@ -596,20 +944,13 @@ mod tests {
         );
         // I reviewed, then author pushed new commits
         pr.timeline = vec![
-            TimelineEvent {
-                event_type: TimelineEventType::Review,
-                actor: "me".into(),
-                created_at: "2024-06-01T10:00:00Z".into(),
-                detail: "APPROVED: Looks good".into(),
-                url: String::new(),
-            },
-            TimelineEvent {
-                event_type: TimelineEventType::Commit,
-                actor: "other".into(),
-                created_at: "2024-06-01T12:00:00Z".into(),
-                detail: "Address feedback".into(),
-                url: String::new(),
-            },
+            review_ev("me", "2024-06-01T10:00:00Z", "APPROVED"),
+            ev(
+                TimelineEventType::Commit,
+                "other",
+                "2024-06-01T12:00:00Z",
+                "Address feedback",
+            ),
         ];
         assert_eq!(store.classify_pr(&pr), PrGroup::ReviewUpdate);
         assert_eq!(store.next_action(&pr), "Re-review");
@@ -917,20 +1258,13 @@ mod tests {
             }],
         }];
         pr.timeline = vec![
-            TimelineEvent {
-                event_type: TimelineEventType::Comment,
-                actor: " alice ".into(),
-                created_at: recent_time(),
-                detail: "issue comment".into(),
-                url: String::new(),
-            },
-            TimelineEvent {
-                event_type: TimelineEventType::Commit,
-                actor: "bob".into(),
-                created_at: recent_time(),
-                detail: "commit".into(),
-                url: String::new(),
-            },
+            ev(
+                TimelineEventType::Comment,
+                " alice ",
+                &recent_time(),
+                "issue comment",
+            ),
+            ev(TimelineEventType::Commit, "bob", &recent_time(), "commit"),
         ];
         store.update_prs(vec![pr]);
         let pr = store.prs.values().next().unwrap();

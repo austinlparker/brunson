@@ -1534,6 +1534,8 @@ mod tests {
                     created_at: format!("2024-01-01T00:00:{:02}Z", i % 60),
                     detail: String::new(),
                     url: String::new(),
+                    actor_is_bot: false,
+                    review_state: None,
                 })
                 .collect(),
             llm_priority: None,

@@ -1143,6 +1143,8 @@ mod tests {
             created_at: "2024-05-01T10:00:00Z".into(),
             detail: "hello".into(),
             url: "https://github.com/org/repo/pull/42#issuecomment-1".into(),
+            actor_is_bot: false,
+            review_state: None,
         }];
         let mut store = PrStore::new("me".into());
         store.update_prs(prs);

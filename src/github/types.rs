@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum PrGroup {
     // ── Authored lane (PRs I created) ──
-    /// Ball is in my court: CI failed, changes requested, or someone commented and I haven't responded.
+    /// Ball is in my court: CI failed, changes requested, or a human (non-bot)
+    /// comment or non-approval review is newer than any of my comments,
+    /// reviews, or pushes. See `PrStore::classify_authored` /
+    /// `PrStore::ball_in_my_court` for the full semantics.
     AuthoredActionNeeded,
     /// Approved + CI green + mergeable — I should merge.
     AuthoredReadyToMerge,
@@ -195,6 +198,16 @@ pub struct TimelineEvent {
     /// event types and for payloads from older daemon versions).
     #[serde(default)]
     pub url: String,
+    /// Whether the actor is a GitHub App/bot (GraphQL author `__typename ==
+    /// "Bot"`). Only populated for comment/review events; defaults to false
+    /// for other event types and for payloads from older daemon versions.
+    #[serde(default)]
+    pub actor_is_bot: bool,
+    /// Raw GraphQL review state (`"APPROVED"`, `"CHANGES_REQUESTED"`,
+    /// `"COMMENTED"`, `"DISMISSED"`, `"PENDING"`) for review events; `None`
+    /// for all other event types and for payloads from older daemon versions.
+    #[serde(default)]
+    pub review_state: Option<String>,
 }
 
 /// The full PullRequest model stored in the daemon.
@@ -307,6 +320,23 @@ mod tests {
         assert!(parse_slug("invalid").is_none());
         assert!(parse_slug("a~b~c").is_none());
         assert!(parse_slug("a~b~c~d").is_none());
+    }
+
+    // Version-skew guard: payloads from daemons predating `actor_is_bot` /
+    // `review_state` (and `url`) must still deserialize with safe defaults.
+    #[test]
+    fn timeline_event_defaults_for_missing_new_fields() {
+        let json = r#"{
+            "event_type": "comment",
+            "actor": "bob",
+            "created_at": "2024-06-01T10:00:00Z",
+            "detail": "hi"
+        }"#;
+        let e: TimelineEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(e.event_type, TimelineEventType::Comment);
+        assert!(!e.actor_is_bot);
+        assert_eq!(e.review_state, None);
+        assert_eq!(e.url, "");
     }
 
     #[test]
